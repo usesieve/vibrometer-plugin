@@ -5,7 +5,7 @@ argument-hint: "[--days 30]"
 allowed-tools: Bash(node:*)
 ---
 
-The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUGIN_ROOT` is empty, it's at `../../scripts/vibrometer.mjs` relative to this file). Nothing is uploaded unless the command includes `--yes`, so follow these steps in order and never add `--yes` before the user has confirmed.
+The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUGIN_ROOT` is empty, it's at `../../scripts/vibrometer.mjs` relative to this file). Nothing is uploaded unless the command includes `--yes`, and conversations are uploaded only when it also includes `--confirm-rights`. Follow these steps in order. Never add `--yes` before the user has confirmed the selection, never add `--confirm-rights` unless the user has said yes to the first statement in step 4, and never add `--allow-improvement` unless the user has said yes to the second statement.
 
 1. **List the conversations.**
 
@@ -25,8 +25,29 @@ The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUG
    node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" analyze --exclude-project acme-client --exclude 3f2a91c0
    ```
 
-   It prints a preview of their vibe check and the list of conversations that would be uploaded. Show the user that list and ask them to confirm. Offer `--private` if they'd rather send only aggregate numbers and no conversation text.
+   It prints a preview of their vibe check and the list of conversations that would be uploaded. Show the user that list and ask them to confirm the selection. Offer `--private` if they'd rather send only aggregate numbers and no conversation text. A `--private` upload sends no conversations, so skip step 4 for it and run the same command with `--yes` once they confirm.
 
-4. **Upload only after they confirm**, by running the same command with `--yes` added.
+4. **Ask about the two statements before uploading conversations.** Show the user both statements word for word, exactly as below (they are also printed by the preview). Don't paraphrase or shorten them.
 
-Then show the result link exactly as printed. Mention that they can share the link with friends to compare, start a group on the site, and earn a rank with `/vibrometer:challenge <slug>` (rankings come only from challenges, never from uploaded conversations).
+   The first statement is required:
+
+   > I'm allowed to upload these conversations, and they don't contain sensitive, confidential or illegal material (such as credentials, other people's personal data, or code I'm not permitted to share).
+
+   The second statement is optional, and the note under it is part of what you show:
+
+   > Let Vibrometer and its partners use these conversations, with secrets and identifiers removed, to improve their services.
+   >
+   > Optional. It applies only to this upload, and you can withdraw it later from your account page.
+
+   - Ask whether the first statement is true for the conversations they chose, and wait for an explicit yes. Never assume it: agreeing to the selection in step 3, asking you to "go ahead", or having confirmed it for an earlier upload doesn't count. If they say no or aren't sure, don't upload. Suggest removing the conversations in question (back to step 2) or using `--private`.
+   - Ask about the second statement as a separate question, after the first. The answer is no unless they clearly say yes. Tell them that saying no doesn't change their vibe check or whether they can upload.
+
+5. **Upload only after both answers**, by running the same command as in step 3 with `--yes --confirm-rights` added, and with `--allow-improvement` as well only if they said yes to the second statement:
+
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" analyze --exclude-project acme-client --exclude 3f2a91c0 --yes --confirm-rights
+   ```
+
+   If the command stops with "Nothing was uploaded", show the user its message and go back to step 4.
+
+Then show the result link exactly as printed. Mention that they can share the link with friends to compare and start a group on the site. Uploaded conversations that the server verifies count toward the Pantheon's habit boards (a `--private` upload doesn't). The skill rankings come from the timed challenges: `/vibrometer:challenge <slug>`.

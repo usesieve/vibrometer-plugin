@@ -102,6 +102,28 @@ var ts = (v) => {
   const t = Date.parse(str(v));
   return isNaN(t) ? 0 : t;
 };
+function readUsage(u) {
+  const split = u.cache_creation || {};
+  const w5 = num(split.ephemeral_5m_input_tokens);
+  const w1 = num(split.ephemeral_1h_input_tokens);
+  const cacheWrite = Math.max(num(u.cache_creation_input_tokens), w5 + w1);
+  return { input: num(u.input_tokens), cacheRead: num(u.cache_read_input_tokens), cacheWrite, output: num(u.output_tokens), cacheWrite1h: Math.min(w1, cacheWrite) };
+}
+var maxUsage = (a, b) => ({
+  input: Math.max(a.input, b.input),
+  cacheRead: Math.max(a.cacheRead, b.cacheRead),
+  cacheWrite: Math.max(a.cacheWrite, b.cacheWrite),
+  output: Math.max(a.output, b.output),
+  cacheWrite1h: Math.max(a.cacheWrite1h ?? 0, b.cacheWrite1h ?? 0)
+});
+function addUsage(to, u) {
+  to.input += u.input;
+  to.cacheRead += u.cacheRead;
+  to.cacheWrite += u.cacheWrite;
+  to.output += u.output;
+  to.cacheWrite1h = (to.cacheWrite1h ?? 0) + (u.cacheWrite1h ?? 0);
+}
+var usageTotal = (u) => u.input + u.cacheRead + u.cacheWrite + u.output;
 function parseJsonl(text) {
   const out = [];
   for (const line of text.split("\n")) {
@@ -149,6 +171,7 @@ function parseClaude(records, fallbackId = "session") {
   let cwd;
   const assistantById = /* @__PURE__ */ new Map();
   const usageById = /* @__PURE__ */ new Map();
+  const subUsageById = /* @__PURE__ */ new Map();
   const toolsSeen = /* @__PURE__ */ new Set();
   let minT = Infinity;
   let maxT = 0;
@@ -160,11 +183,10 @@ function parseClaude(records, fallbackId = "session") {
     const msg = r.message || {};
     if (r.isSidechain === true) {
       if (r.type === "assistant" && msg.usage) {
-        const u = msg.usage;
-        subagentUsage.input += num(u.input_tokens);
-        subagentUsage.output += num(u.output_tokens);
-        subagentUsage.cacheRead += num(u.cache_read_input_tokens);
-        subagentUsage.cacheWrite += num(u.cache_creation_input_tokens);
+        const mid = str(msg.id) || str(r.requestId) || str(r.uuid);
+        const prev = subUsageById.get(mid);
+        const model = str(msg.model) || prev?.model || "unknown";
+        subUsageById.set(mid, { model, usage: maxUsage(prev?.usage ?? zero(), readUsage(msg.usage)) });
       }
       continue;
     }
@@ -208,14 +230,7 @@ function parseClaude(records, fallbackId = "session") {
         events.push(ev);
       }
       if (msg.usage) {
-        const u = msg.usage;
-        const prev = usageById.get(mid) ?? zero();
-        usageById.set(mid, {
-          input: Math.max(prev.input, num(u.input_tokens)),
-          cacheRead: Math.max(prev.cacheRead, num(u.cache_read_input_tokens)),
-          cacheWrite: Math.max(prev.cacheWrite, num(u.cache_creation_input_tokens)),
-          output: Math.max(prev.output, num(u.output_tokens))
-        });
+        usageById.set(mid, maxUsage(usageById.get(mid) ?? zero(), readUsage(msg.usage)));
       }
       const c = Array.isArray(msg.content) ? msg.content : [];
       for (const b of c) {
@@ -262,6 +277,12 @@ function parseClaude(records, fallbackId = "session") {
     const ev = assistantById.get(mid);
     if (ev) ev.usage = u;
   }
+  const subagentUsageByModel = {};
+  for (const { model, usage } of subUsageById.values()) {
+    if (model === "<synthetic>" && !usageTotal(usage)) continue;
+    addUsage(subagentUsage, usage);
+    addUsage(subagentUsageByModel[model] ??= zero(), usage);
+  }
   function pushPrompt(text, t, isMeta) {
     if (isMeta) return;
     if (/^\s*\[Request interrupted by user/.test(text)) {
@@ -288,6 +309,7 @@ function parseClaude(records, fallbackId = "session") {
     models: [...models],
     events,
     subagentUsage,
+    subagentUsageByModel,
     version,
     cwd,
     firstPrompt: firstPromptOf(events)
@@ -309,6 +331,7 @@ function parseCodex(records, fallbackId = "session") {
   let maxT = 0;
   let lastAssistant;
   let prevCum = zero();
+  let curModel;
   const exitCodes = /* @__PURE__ */ new Map();
   const resultsById = /* @__PURE__ */ new Map();
   for (const r of records) {
@@ -326,7 +349,10 @@ function parseCodex(records, fallbackId = "session") {
       continue;
     }
     if (r.type === "turn_context") {
-      if (p.model) models.add(str(p.model));
+      if (p.model) {
+        curModel = str(p.model);
+        models.add(curModel);
+      }
       continue;
     }
     if (r.type === "event_msg") {
@@ -354,10 +380,11 @@ function parseCodex(records, fallbackId = "session") {
             output: Math.max(0, cum.output - prevCum.output)
           };
           if (delta.input + delta.cacheRead + delta.output > 0) {
-            if (!lastAssistant) {
-              lastAssistant = { kind: "assistant", t, model: [...models].at(-1), toolCount: 0, text: "" };
+            if (!lastAssistant || lastAssistant.usage && curModel && lastAssistant.model !== curModel) {
+              lastAssistant = { kind: "assistant", t, model: curModel, toolCount: 0, text: "" };
               events.push(lastAssistant);
             }
+            lastAssistant.model ??= curModel;
             const u = lastAssistant.usage ?? zero();
             lastAssistant.usage = { input: u.input + delta.input, cacheRead: u.cacheRead + delta.cacheRead, cacheWrite: 0, output: u.output + delta.output };
           }
@@ -380,7 +407,7 @@ function parseCodex(records, fallbackId = "session") {
     if (r.type === "response_item") {
       if (ptype === "message" && p.role === "assistant") {
         const parts = Array.isArray(p.content) ? p.content : [];
-        lastAssistant = { kind: "assistant", t, model: [...models].at(-1), toolCount: 0, text: parts.map((x) => str(x.text)).join("").slice(0, 2e3) };
+        lastAssistant = { kind: "assistant", t, model: curModel, toolCount: 0, text: parts.map((x) => str(x.text)).join("").slice(0, 2e3) };
         events.push(lastAssistant);
       } else if (ptype === "function_call" || ptype === "custom_tool_call" || ptype === "local_shell_call") {
         let input = {};
@@ -420,7 +447,7 @@ function parseCodex(records, fallbackId = "session") {
         }
         const cat = name === "apply_patch" ? "edit" : categorizeTool(name, command);
         if (!lastAssistant || lastAssistant.t < t - 6e4) {
-          lastAssistant = { kind: "assistant", t, model: [...models].at(-1), toolCount: 0, text: "" };
+          lastAssistant = { kind: "assistant", t, model: curModel, toolCount: 0, text: "" };
           events.push(lastAssistant);
         }
         lastAssistant.toolCount++;
@@ -780,23 +807,95 @@ function codifiedLessons(items) {
   return done.size;
 }
 
+// src/lib/analyzer/prices.ts
+var CACHE_READ = 0.1;
+var CACHE_WRITE_5M = 1.25;
+var CACHE_WRITE_1H = 2;
+var MODEL_FAMILIES = [
+  // Anthropic: platform.claude.com pricing. Fable 5.2, Fable 5.1, Opus 5.5 and Sonnet 5.5 list cache reads below 0.1×.
+  { name: "Claude Fable 5.2", prefixes: ["claude-fable-5-2"], input: 8, output: 40, cacheRead: 0.025 },
+  { name: "Claude Fable 5.1", prefixes: ["claude-fable-5-1"], input: 10, output: 50, cacheRead: 0.025 },
+  { name: "Claude Fable 5", prefixes: ["claude-fable-5", "claude-fable-5-0"], input: 10, output: 50 },
+  { name: "Claude Opus 5.5", prefixes: ["claude-opus-5-5"], input: 4, output: 20, cacheRead: 0.05 },
+  { name: "Claude Opus 5", prefixes: ["claude-opus-5", "claude-opus-5-0"], input: 5, output: 25 },
+  { name: "Claude Opus 4.8", prefixes: ["claude-opus-4-8"], input: 5, output: 25 },
+  { name: "Claude Opus 4.7", prefixes: ["claude-opus-4-7"], input: 5, output: 25 },
+  { name: "Claude Opus 4.6", prefixes: ["claude-opus-4-6"], input: 5, output: 25 },
+  { name: "Claude Opus 4.5", prefixes: ["claude-opus-4-5"], input: 5, output: 25 },
+  { name: "Claude Opus 4.1", prefixes: ["claude-opus-4-1"], input: 15, output: 75 },
+  { name: "Claude Opus 4", prefixes: ["claude-opus-4", "claude-opus-4-0"], input: 15, output: 75 },
+  { name: "Claude Sonnet 5.5", prefixes: ["claude-sonnet-5-5"], input: 2, output: 10, cacheRead: 0.05 },
+  { name: "Claude Sonnet 5", prefixes: ["claude-sonnet-5", "claude-sonnet-5-0"], input: 2, output: 10 },
+  { name: "Claude Sonnet 4.6", prefixes: ["claude-sonnet-4-6"], input: 3, output: 15 },
+  { name: "Claude Sonnet 4.5", prefixes: ["claude-sonnet-4-5"], input: 3, output: 15 },
+  { name: "Claude Sonnet 4", prefixes: ["claude-sonnet-4", "claude-sonnet-4-0"], input: 3, output: 15 },
+  { name: "Claude Haiku 5.5", prefixes: ["claude-haiku-5-5"], input: 0.1, output: 0.5 },
+  { name: "Claude Haiku 4.5", prefixes: ["claude-haiku-4-5"], input: 1, output: 5 },
+  { name: "Claude Haiku 3.5", prefixes: ["claude-3-5-haiku", "claude-haiku-3-5"], input: 0.8, output: 4 },
+  // OpenAI (Codex): from memory of OpenAI's price list, not confirmed against the current one. Cached input is 0.1×
+  // and there is no charge for writing the cache. Models not listed here are left out of the cost.
+  { name: "GPT-5", prefixes: ["gpt-5"], input: 1.25, output: 10, needsCheck: true },
+  { name: "GPT-5 Codex", prefixes: ["gpt-5-codex"], input: 1.25, output: 10, needsCheck: true },
+  { name: "GPT-5 mini", prefixes: ["gpt-5-mini"], input: 0.25, output: 2, needsCheck: true },
+  { name: "GPT-5.1", prefixes: ["gpt-5.1"], input: 1.25, output: 10, needsCheck: true },
+  { name: "GPT-5.1 Codex", prefixes: ["gpt-5.1-codex"], input: 1.25, output: 10, needsCheck: true },
+  { name: "GPT-5.1 Codex Max", prefixes: ["gpt-5.1-codex-max"], input: 1.25, output: 10, needsCheck: true },
+  { name: "GPT-5.1 Codex mini", prefixes: ["gpt-5.1-codex-mini"], input: 0.25, output: 2, needsCheck: true }
+];
+var SUFFIX = /^(?:$|-\d{8}(?:$|\W|-v\d)|-\d{4}-\d{2}-\d{2}$|@|\[|:|-v\d)/;
+function modelFamilyOf(model) {
+  const id = model.trim().toLowerCase().replace(/^(?:[a-z]{2,4}\.)?anthropic\./, "");
+  let best = -1;
+  let bestLen = 0;
+  MODEL_FAMILIES.forEach((f, i) => {
+    for (const p of f.prefixes) if (p.length > bestLen && id.startsWith(p) && SUFFIX.test(id.slice(p.length))) {
+      best = i;
+      bestLen = p.length;
+    }
+  });
+  return best;
+}
+function tokensCost(f, t) {
+  return (t.input * f.input + t.cacheRead * f.input * (f.cacheRead ?? CACHE_READ) + t.cacheWrite5m * f.input * CACHE_WRITE_5M + t.cacheWrite1h * f.input * CACHE_WRITE_1H + t.output * f.output) / 1e6;
+}
+var tokenSum = (t) => t.input + t.output + t.cacheRead + t.cacheWrite5m + t.cacheWrite1h;
+function apiCost(byModel) {
+  const fam = /* @__PURE__ */ new Map();
+  let unpricedTokens = 0;
+  const unpricedModels = [];
+  for (const [model, t] of Object.entries(byModel)) {
+    const i = modelFamilyOf(model);
+    if (i < 0) {
+      if (tokenSum(t) > 0) {
+        unpricedTokens += tokenSum(t);
+        unpricedModels.push(model);
+      }
+      continue;
+    }
+    const cur = fam.get(i) ?? { usd: 0, tokens: 0 };
+    cur.usd += tokensCost(MODEL_FAMILIES[i], t);
+    cur.tokens += tokenSum(t);
+    fam.set(i, cur);
+  }
+  const families = [...fam].map(([family, x]) => ({ family, ...x })).sort((a, b) => b.usd - a.usd || b.tokens - a.tokens);
+  return { usd: families.reduce((a, f) => a + f.usd, 0), families, unpricedTokens, unpricedModels };
+}
+
 // src/lib/analyzer/metrics.ts
 var CATS = ["read", "search", "edit", "exec", "test", "build", "git", "web", "agent", "plan", "ask", "mcp", "other"];
 var IDLE_GAP_MS = 10 * 60 * 1e3;
-var PRICES = [
-  [/opus-4-[01]|opus-4-2|claude-3-opus/i, 15, 75],
-  [/opus/i, 5, 25],
-  [/sonnet/i, 3, 15],
-  [/haiku/i, 1, 5],
-  [/fable/i, 5, 25],
-  [/gpt-5.*mini|o4-mini/i, 0.25, 2],
-  [/gpt|codex|o3|o4/i, 1.25, 10]
-];
-function priceFor(model) {
-  if (model) {
-    for (const [re, i, o] of PRICES) if (re.test(model)) return [i, o];
-  }
-  return [3, 15];
+var TOKEN_FIELDS = ["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"];
+var noTokens = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 });
+var billed = (u) => {
+  const w1 = Math.min(u.cacheWrite1h ?? 0, u.cacheWrite);
+  return { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite5m: u.cacheWrite - w1, cacheWrite1h: w1 };
+};
+function addTokens(to, model, u) {
+  if (!(u.input + u.output + u.cacheRead + u.cacheWrite)) return;
+  const key = (model || "unknown").slice(0, 60);
+  const t = to[key] ??= noTokens();
+  const b = billed(u);
+  for (const f of TOKEN_FIELDS) t[f] += b[f];
 }
 var median = (xs) => {
   if (!xs.length) return 0;
@@ -882,10 +981,14 @@ function computeMetrics(sessions, opts = {}) {
   let weekend = 0;
   let night = 0;
   const tz = opts.tzOffsetMinutes ?? 0;
+  const byModel = {};
+  const promptsByDay = /* @__PURE__ */ new Map();
   const spans = [];
   for (const s of sessions) {
     const events = s.events.filter((e) => (!opts.since || e.t >= opts.since) && (!opts.until || e.t <= opts.until));
     m.tokens.subagent += s.subagentUsage.input + s.subagentUsage.output + s.subagentUsage.cacheRead + s.subagentUsage.cacheWrite;
+    if (s.subagentUsageByModel) for (const [model, u2] of Object.entries(s.subagentUsageByModel)) addTokens(byModel, model, u2);
+    else addTokens(byModel, s.models[0], s.subagentUsage);
     if (!events.length) continue;
     m.sessions++;
     {
@@ -976,7 +1079,8 @@ function computeMetrics(sessions, opts = {}) {
       verifiedAfterLastEdit = false;
     };
     let sessionUsage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
-    let sessionCost = 0;
+    const sessionByModel = {};
+    let lastModel;
     for (const e of events) {
       switch (e.kind) {
         case "prompt": {
@@ -1008,6 +1112,8 @@ function computeMetrics(sessions, opts = {}) {
             if (h >= 23 || h < 5) night++;
             const dow = d.getUTCDay();
             if (dow === 0 || dow === 6) weekend++;
+            const day = d.toISOString().slice(0, 10);
+            promptsByDay.set(day, (promptsByDay.get(day) ?? 0) + 1);
           }
           if (/\b(plan|outline|design|architecture|approach|step[- ]by[- ]step|before (you )?(code|start|implement))\b/i.test(text) && !sawEdit) {
             sawPlan = true;
@@ -1024,8 +1130,8 @@ function computeMetrics(sessions, opts = {}) {
               cacheWrite: sessionUsage.cacheWrite + e.usage.cacheWrite,
               output: sessionUsage.output + e.usage.output
             };
-            const [pi, po] = priceFor(e.model);
-            sessionCost += (e.usage.input * pi + e.usage.cacheRead * pi * 0.1 + e.usage.cacheWrite * pi * 1.25 + e.usage.output * po) / 1e6;
+            addTokens(sessionByModel, e.model ?? s.models[0], e.usage);
+            if (e.model && e.model !== "<synthetic>") lastModel = e.model;
           }
           break;
         }
@@ -1090,15 +1196,22 @@ function computeMetrics(sessions, opts = {}) {
     }
     m.editedFiles += editedPaths.size;
     const u = s.totalUsageOverride && !opts.since ? s.totalUsageOverride : sessionUsage;
-    if (s.totalUsageOverride && !opts.since && sessionCost === 0) {
-      const [pi, po] = priceFor(s.models[0]);
-      sessionCost = (u.input * pi + u.cacheRead * pi * 0.1 + u.output * po) / 1e6;
+    if (u !== sessionUsage) {
+      const total = billed(u);
+      for (const f of TOKEN_FIELDS) {
+        const sum = Object.values(sessionByModel).reduce((a, t) => a + t[f], 0);
+        if (sum > 0) for (const t of Object.values(sessionByModel)) t[f] *= total[f] / sum;
+        else if (total[f] > 0) (sessionByModel[(lastModel ?? s.models.at(-1) ?? "unknown").slice(0, 60)] ??= noTokens())[f] += total[f];
+      }
+    }
+    for (const [model, t] of Object.entries(sessionByModel)) {
+      const all = byModel[model] ??= noTokens();
+      for (const f of TOKEN_FIELDS) all[f] += t[f];
     }
     m.tokens.input += u.input;
     m.tokens.cacheRead += u.cacheRead;
     m.tokens.cacheWrite += u.cacheWrite;
     m.tokens.output += u.output;
-    m.estCostUsd += sessionCost;
   }
   const edges = spans.flatMap(([a, b]) => [[a, 1], [b, -1]]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
   let open = 0, last = 0, wall = 0, par = 0, peak = 0;
@@ -1128,7 +1241,10 @@ function computeMetrics(sessions, opts = {}) {
   m.agentWaitMinutes = Math.round(m.agentWaitMinutes * 10) / 10;
   m.spanMinutes = Math.round(m.spanMinutes * 10) / 10;
   m.longestSessionMinutes = Math.round(m.longestSessionMinutes * 10) / 10;
-  m.estCostUsd = Math.round(m.estCostUsd * 100) / 100;
+  for (const t of Object.values(byModel)) for (const f of TOKEN_FIELDS) t[f] = Math.round(t[f]);
+  m.tokensByModel = byModel;
+  m.estCostUsd = Math.round(apiCost(byModel).usd * 100) / 100;
+  m.busiestDayPrompts = Math.max(0, ...promptsByDay.values());
   return m;
 }
 
@@ -1138,9 +1254,29 @@ var PRIOR_STRENGTH = 300;
 var hourLabel = (h) => `${(Math.round(h) + 11) % 12 + 1}${Math.round(h) % 24 < 12 ? "am" : "pm"}`;
 var pct = (v) => `${Math.round(v * 100)}%`;
 var per = (a, b, min = 1) => b >= min ? a / b : null;
-var big = (v) => v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e4 ? `${Math.round(v / 1e3)}k` : Math.round(v).toLocaleString("en-US");
+var big = (v) => v >= 1e9 ? `${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e4 ? `${Math.round(v / 1e3)}k` : Math.round(v).toLocaleString("en-US");
 var wallHours = (m) => (m.wallMinutes ?? m.activeMinutes) / 60;
 var n1 = (v) => v >= 10 ? String(Math.round(v)) : v.toFixed(1).replace(/\.0$/, "");
+var LINK_MAX = 9999999;
+var fit = (v, scale) => Math.min(v, LINK_MAX / scale);
+var allTokens = (m) => m.tokensByModel ? Object.values(m.tokensByModel).reduce((a, t) => a + tokenSum(t), 0) : m.tokens.total + m.tokens.subagent;
+function cacheShare(m) {
+  if (!m.tokensByModel) return m.tokens.input + m.tokens.cacheRead + m.tokens.cacheWrite > 0 ? m.cacheHitRatio : null;
+  let read = 0, input = 0;
+  for (const t of Object.values(m.tokensByModel)) {
+    read += t.cacheRead;
+    input += t.input + t.cacheRead + t.cacheWrite5m + t.cacheWrite1h;
+  }
+  return input > 0 ? read / input : null;
+}
+var costOf = (m) => m.tokensByModel && Object.keys(m.tokensByModel).length ? apiCost(m.tokensByModel) : null;
+var tokenCount = (v) => v >= 1e9 ? `${(v / 1e9).toFixed(1).replace(/\.0$/, "")}B` : v >= 1e8 ? `${Math.round(v / 1e6)}M` : big(v);
+var usd = (v) => v >= 100 ? `$${Math.round(v).toLocaleString("en-US")}` : `$${v.toFixed(2)}`;
+var modelName = (v) => MODEL_FAMILIES[Math.round(v)]?.name ?? "an unknown model";
+var duration = (mins) => {
+  const t = Math.round(mins), h = Math.floor(t / 60), mm = t % 60;
+  return h ? `${h} h${mm ? ` ${mm} min` : ""}` : `${t} min`;
+};
 var SIGNALS = [
   { key: "verify", name: "Checks after edits", scale: 1e3, prior: [0.2, 0.55, 0.9], good: 1, value: (m) => per(m.verifiedEditTurns, m.editTurns, 2), fmt: pct, line: (v) => `You check the code after ${v} of your edits`, they: (v, w) => `${w} checks the code after ${v} of their edits` },
   { key: "steps", name: "Agent steps per prompt", scale: 10, prior: [3, 8, 13], good: 1, value: (m) => per(m.toolCalls, m.humanTurns, 3), fmt: n1, line: (v) => `Your agent takes ${v} steps for every prompt that you write`, they: (v, w) => `${w}'s agent takes ${v} steps for every prompt that they write` },
@@ -1198,7 +1334,32 @@ var SIGNALS = [
   // The "Tokens per line written" prior [800, 4000, 20000] times about 200 lines in a typical coding session, then
   // widened because sessions that don't end verified add tokens but not outcomes. Stored in thousands (scale 0.001)
   // so that share links stay within seven digits.
-  { key: "tokensFinish", name: "Tokens per verified session", scale: 1e-3, prior: [15e4, 1e6, 6e6], good: -1, value: (m) => per(m.tokens.input + m.tokens.cacheWrite + m.tokens.output + m.tokens.subagent, m.verifiedFinishes ?? 0, 2), fmt: big, line: (v) => `Your agents use ${v} tokens for each session that ends verified`, they: (v, w) => `${w}'s agents use ${v} tokens for each session that ends verified` }
+  { key: "tokensFinish", name: "Tokens per verified session", scale: 1e-3, prior: [15e4, 1e6, 6e6], good: -1, value: (m) => per(m.tokens.input + m.tokens.cacheWrite + m.tokens.output + m.tokens.subagent, m.verifiedFinishes ?? 0, 2), fmt: big, line: (v) => `Your agents use ${v} tokens for each session that ends verified`, they: (v, w) => `${w}'s agents use ${v} tokens for each session that ends verified` },
+  // Wrapped totals (fun only; never compared or ranked). Totals depend on how much someone uploads, so each value is
+  // capped to fit seven digits at its scale. Tokens are stored in units of 10,000 and dollars in units of 10 cents.
+  { key: "tokensAll", name: "Tokens used", scale: 1e-4, prior: [5e6, 15e7, 3e9], wrapped: true, fun: true, value: (m) => {
+    const t = allTokens(m);
+    return t > 0 ? fit(t, 1e-4) : null;
+  }, fmt: tokenCount, line: (v) => `Your agents used ${v} tokens`, they: (v, w) => `${w}'s agents used ${v} tokens` },
+  { key: "cacheShare", name: "Input read from the cache", scale: 1e3, prior: [0.6, 0.9, 0.97], wrapped: true, fun: true, value: cacheShare, fmt: pct, line: (v) => `${v} of your agents' input tokens were read from the cache`, they: (v, w) => `${v} of ${w}'s agents' input tokens were read from the cache` },
+  { key: "apiCost", name: "Cost at API list prices", scale: 10, prior: [5, 150, 3e3], wrapped: true, fun: true, value: (m) => {
+    const c = costOf(m);
+    return c && c.usd > 0 ? fit(c.usd, 10) : null;
+  }, fmt: usd, line: (v) => `Your tokens would cost ${v} at API list prices`, they: (v, w) => `${w}'s tokens would cost ${v} at API list prices` },
+  // an index into MODEL_FAMILIES (src/lib/analyzer/prices.ts), which is append-only so that old links keep their model
+  { key: "mainModel", name: "Main model by cost", scale: 1, prior: [0, 7, 20], wrapped: true, fun: true, value: (m) => costOf(m)?.families[0]?.family ?? null, fmt: modelName, line: (v) => `Most of your API cost is ${v}`, they: (v, w) => `Most of ${w}'s API cost is ${v}` },
+  { key: "mainModelShare", name: "Main model's share of the cost", scale: 1e3, prior: [0.5, 0.8, 0.98], wrapped: true, fun: true, value: (m) => {
+    const c = costOf(m);
+    return c && c.usd > 0 ? c.families[0].usd / c.usd : null;
+  }, fmt: pct, line: (v) => `Your main model accounts for ${v} of your API cost`, they: (v, w) => `${w}'s main model accounts for ${v} of their API cost` },
+  { key: "unpricedTokens", name: "Tokens without a known price", scale: 1e-4, prior: [0, 0, 1e7], wrapped: true, fun: true, value: (m) => {
+    const c = costOf(m);
+    return c ? fit(c.unpricedTokens, 1e-4) : null;
+  }, fmt: tokenCount, line: (v) => `${v} of your tokens came from models without a known price`, they: (v, w) => `${v} of ${w}'s tokens came from models without a known price` },
+  { key: "promptsAll", name: "Prompts sent", scale: 1, prior: [40, 400, 3e3], wrapped: true, fun: true, value: (m) => m.humanTurns > 0 ? fit(m.humanTurns, 1) : null, fmt: (v) => Math.round(v).toLocaleString("en-US"), line: (v) => `You sent ${v} prompts`, they: (v, w) => `${w} sent ${v} prompts` },
+  { key: "linesAll", name: "Lines written by agents", scale: 1, prior: [500, 8e3, 8e4], wrapped: true, fun: true, value: (m) => m.linesWritten > 0 ? fit(m.linesWritten, 1) : null, fmt: (v) => Math.round(v).toLocaleString("en-US"), line: (v) => `Your agents wrote ${v} lines`, they: (v, w) => `${w}'s agents wrote ${v} lines` },
+  { key: "busiestDay", name: "Most prompts in one day", scale: 1, prior: [10, 40, 120], wrapped: true, fun: true, value: (m) => m.busiestDayPrompts ? fit(m.busiestDayPrompts, 1) : null, fmt: (v) => String(Math.round(v)), line: (v) => `You sent ${v} prompts on your busiest day`, they: (v, w) => `${w} sent ${v} prompts on their busiest day` },
+  { key: "longestSession", name: "Longest session", scale: 1, prior: [30, 120, 400], wrapped: true, fun: true, value: (m) => m.longestSessionMinutes > 0 ? fit(m.longestSessionMinutes, 1) : null, fmt: duration, line: (v) => `Your longest session had ${v} of active work`, they: (v, w) => `${w}'s longest session had ${v} of active work` }
 ];
 var SIGNAL_BY_KEY = Object.fromEntries(SIGNALS.map((s) => [s.key, s]));
 function signalValues(m) {
@@ -1729,7 +1890,7 @@ function buildFunStats(m) {
   const peakHour = m.hourHistogram.indexOf(Math.max(...m.hourHistogram));
   const hourLabel2 = (h) => `${(h + 11) % 12 + 1}${h < 12 ? "am" : "pm"}`;
   const stats = [
-    { label: "Tokens used", value: fmtNum(m.tokens.total + m.tokens.subagent), note: `about $${m.estCostUsd.toFixed(2)} at list price` },
+    { label: "Tokens used", value: fmtNum(m.tokens.total + m.tokens.subagent), note: `about $${m.estCostUsd.toFixed(2)} at API list prices` },
     { label: "Prompts sent", value: String(m.humanTurns), note: `across ${m.sessions} session${m.sessions === 1 ? "" : "s"}` },
     { label: "Agent tool calls", value: fmtNum(m.toolCalls), note: fav && fav[1] ? `mostly ${fav[0]}` : void 0 },
     { label: "Lines written by AI", value: fmtNum(m.linesWritten) },
@@ -1842,11 +2003,40 @@ function compactTranscript(text, opts = { mode: "analysis" }) {
   return out.join("\n");
 }
 
+// src/lib/consent.ts
+var CONSENT_VERSION = "2026-11-11";
+var RIGHTS_STATEMENT = "I'm allowed to upload these conversations, and they don't contain sensitive, confidential or illegal material (such as credentials, other people's personal data, or code I'm not permitted to share).";
+var IMPROVEMENT_STATEMENT = "Let Vibrometer and its partners use these conversations, with secrets and identifiers removed, to improve their services.";
+var IMPROVEMENT_NOTE = "Optional. It applies only to this upload, and you can withdraw it later from your account page.";
+var RIGHTS_REQUIRED_ERROR = `Confirm this statement before uploading: "${RIGHTS_STATEMENT}" Send confirmRights: true with the upload (in the CLI, add --confirm-rights).`;
+var consentFields = (allowImprovement) => ({ confirmRights: true, allowImprovement, consentVersion: CONSENT_VERSION });
+
 // src/cli/vibrometer.ts
 var PRIVACY = `Before you upload, leave out any conversation that contains personal, sensitive or confidential
 information: customer or patient data, credentials, financial or health details, or code and documents
 that you aren't allowed to share. We strip common secrets (API keys, tokens, passwords, emails), but we
 can't recognise everything, so choose what to include.`;
+var CONSENT = `Uploading conversations needs your confirmation of this statement (add --confirm-rights):
+  "${RIGHTS_STATEMENT}"
+
+To also agree to this statement, add --allow-improvement:
+  "${IMPROVEMENT_STATEMENT}"
+  ${IMPROVEMENT_NOTE}`;
+var flagOn = (v) => v === true || typeof v === "string" && !/^(false|no|0)$/i.test(v);
+function requireConsent(flags, retry) {
+  if (!flagOn(flags["confirm-rights"])) {
+    console.log(`
+Nothing was uploaded. Uploading conversations needs your confirmation of this statement:
+  "${RIGHTS_STATEMENT}"`);
+    console.log(`
+If the statement is true, run ${retry} again with --confirm-rights added.`);
+    console.log(`You can also add --allow-improvement to agree to this statement:
+  "${IMPROVEMENT_STATEMENT}"
+  ${IMPROVEMENT_NOTE}`);
+    process.exit(1);
+  }
+  return consentFields(flagOn(flags["allow-improvement"]));
+}
 var CFG_DIR = process.env.VIBROMETER_HOME || join(homedir(), ".vibrometer");
 var CFG = join(CFG_DIR, "config.json");
 var ACTIVE = join(CFG_DIR, "active-challenge.json");
@@ -2007,13 +2197,21 @@ Read ${m.sessions} conversations \xB7 ${m.humanTurns} prompts \xB7 ${m.toolCalls
 Would upload ${mains.length} redacted conversation(s), ${(bytes / 1e6).toFixed(1)}MB:`);
       for (const x of mains) console.log(`   ${x.id}  ${new Date(x.s.startedAt).toISOString().slice(0, 10)}  ${x.project.padEnd(28)}  ${(x.s.firstPrompt ?? "").replace(/\s+/g, " ").slice(0, 60)}`);
     }
-    console.log(`
+    if (priv) console.log(`
 ${PRIVACY}
 
-Nothing was uploaded. To upload exactly this selection, run the same command with --yes.`);
-    console.log("To change it: --sessions <id,...>, --exclude <id,...>, --project / --exclude-project <name>, --days N, or --private (numbers only).");
+Nothing was uploaded. To upload exactly these numbers, run the same command with --yes.`);
+    else {
+      console.log(`
+${PRIVACY}
+
+${CONSENT}`);
+      console.log("\nNothing was uploaded. To upload exactly this selection, run the same command with --yes --confirm-rights (and --allow-improvement if you agree to the optional statement).");
+    }
+    console.log("To change it: --sessions <id,...>, --exclude <id,...>, --project / --exclude-project <name>, --days N, or --private (numbers only, no conversations, so no confirmation is needed).");
     return;
   }
+  const consent = priv ? null : requireConsent(flags, "the same command");
   if (bytes > 36e6) {
     console.log(`
 That's ${(bytes / 1e6).toFixed(0)}MB after compaction (max 36MB). Use --days or --project to narrow it down.`);
@@ -2025,6 +2223,7 @@ That's ${(bytes / 1e6).toFixed(0)}MB after compaction (max 36MB). Use --days or 
   if (flags["open-to-work"]) profile.openToWork = true;
   const body = {
     ...priv ? { metrics: m } : { transcripts, tzOffsetMinutes: (/* @__PURE__ */ new Date()).getTimezoneOffset() },
+    ...consent ?? {},
     ...Object.keys(profile).length ? { profile } : {}
   };
   const res = await api("/api/analyses", body);
@@ -2034,6 +2233,10 @@ That's ${(bytes / 1e6).toFixed(0)}MB after compaction (max 36MB). Use --days or 
 \u{1F512} Verified: ${v.accepted}/${v.uploaded} sessions passed authenticity checks.`);
     if (v.rejected?.length) console.log(`   Excluded: ${v.rejected.slice(0, 3).map((r) => r.reasons.join(", ")).join(" \xB7 ")}`);
   } else console.log("\n\u{1F512} Private result: only aggregate numbers were sent.");
+  if (consent)
+    console.log(
+      consent.allowImprovement ? "   You let Vibrometer and its partners use these conversations, with secrets and identifiers removed, to improve their services. You can withdraw this on your account page." : "   Vibrometer and its partners won't use these conversations to improve their services (you didn't add --allow-improvement)."
+    );
   console.log(`
 \u2728 Your vibe check, every habit compared with other people, and your share link:
    ${res.url}
@@ -2171,7 +2374,8 @@ async function cmdSubmit(flags) {
     for (const f of readdirSync(subDir)) if (f.endsWith(".jsonl")) raw += "\n" + readFileSync(join(subDir, f), "utf8");
   }
   const transcript = tPath ? compactTranscript(raw, { mode: "challenge" }) : void 0;
-  let r = await api("/api/submit", { nonce: active.nonce, code, transcript }, { prefer: "respond-async" });
+  const consent = transcript ? requireConsent(flags, "vibrometer submit") : null;
+  let r = await api("/api/submit", { nonce: active.nonce, code, transcript, ...consent ?? {} }, { prefer: "respond-async" });
   if (r.status === "pending" || r.status === "running") {
     process.stdout.write("   Grading on the server");
     const until = Date.now() + 10 * 6e4;
@@ -2261,15 +2465,22 @@ ${r.url}`);
 
   list [--days 30] [--json]   your conversations, grouped by project, with ids
   analyze [--days 30] [--sessions id,...] [--exclude id,...] [--project name,...] [--exclude-project name,...]
-          [--private] [--yes] [--handle h] [--school S] [--major M] [--city C] [--country X] [--grad-year Y] [--open-to-work]
-                           shows what would be sent; add --yes to upload it (--private = numbers only)
+          [--private] [--yes --confirm-rights [--allow-improvement]]
+          [--handle h] [--school S] [--major M] [--city C] [--country X] [--grad-year Y] [--open-to-work]
+                           shows what would be sent; add --yes --confirm-rights to upload it
+                           (--private = numbers only, no conversations, no confirmation needed)
   link                     one-time link that signs your browser into this profile
   challenge <slug> [--dir .]   enroll in a challenge and start the clock
   update                       fetch follow-ups (new files, changed requirements) released during the challenge
   ask "question"               ask the challenge's stakeholder (limited questions); no question lists past answers
-  submit [--transcript path]   grade your solution and post to the leaderboard
+  submit --confirm-rights [--allow-improvement] [--transcript path]
+                               grade your solution and post to the leaderboard (uploads this session's log)
   login <token> [--server URL] link to your profile (token from ${server()}/me)
   status                   show config
+
+  --confirm-rights      you confirm: "${RIGHTS_STATEMENT}"
+  --allow-improvement   optional, off by default: "${IMPROVEMENT_STATEMENT}"
+                        ${IMPROVEMENT_NOTE}
 
   Server: ${server()}`);
   }

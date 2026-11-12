@@ -16,6 +16,6 @@ If no slug was given, run the script without one to list where challenges are fo
 After enrolling:
 1. Read `CHALLENGE.md` carefully and implement the solution in the entry file it names. Keep the `// vibrometer nonce:` line at the top of the file.
 2. Run the public tests with `node --test`. The hidden tests are stricter, so cover the edge cases the spec describes.
-3. When the user is happy, or when they asked you to go all the way, submit with `/vibrometer:submit`.
+3. When the user is happy, or when they asked you to go all the way, submit with `/vibrometer:submit`. Submitting uploads this session's transcript, so it first asks the user to confirm the upload statement; even when they asked you to go all the way, wait for their answer.
 
 This session's transcript is the proof of work, so do the work in this session. Only the user's first attempt at each challenge is ranked; if the output says "Practice attempt", tell the user.
