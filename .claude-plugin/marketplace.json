@@ -1,0 +1,13 @@
+{
+  "name": "vibrometer",
+  "owner": {
+    "name": "Vibrometer"
+  },
+  "plugins": [
+    {
+      "name": "vibrometer",
+      "source": "./plugin",
+      "description": "Your vibe check from the conversations you choose, plus timed AI-coding challenges."
+    }
+  ]
+}

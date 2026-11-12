@@ -1,0 +1,15 @@
+{
+  "name": "vibrometer",
+  "version": "0.2.0",
+  "description": "See how you code with AI: get your vibe check from your Claude Code and Codex conversations (you choose which to include), compare with friends, and compete on timed challenges.",
+  "author": {
+    "name": "Vibrometer"
+  },
+  "keywords": [
+    "vibe coding",
+    "agentic coding",
+    "vibe-check",
+    "challenges",
+    "leaderboard"
+  ]
+}
