@@ -1,6 +1,6 @@
 {
   "name": "vibrometer",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "See how you code with AI: get your vibe check from your Claude Code and Codex conversations (you choose which to include), compare with friends, and compete on timed challenges.",
   "author": {
     "name": "Vibrometer"

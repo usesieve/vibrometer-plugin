@@ -16,4 +16,4 @@ Then sign in with `/vibrometer:login` (it opens vibrometer.ai, where you approve
 `/vibrometer:analyze`, `/vibrometer:challenge <slug>` (the ticket), `/vibrometer:start` (the clock) or `/vibrometer:submit`.
 
 Nothing is uploaded until you confirm the selection and the upload statement. This repository is generated from
-the main Vibrometer repository (plugin version 0.3.0); changes made here are overwritten.
+the main Vibrometer repository (plugin version 0.3.1); changes made here are overwritten.

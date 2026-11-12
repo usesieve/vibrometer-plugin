@@ -271,9 +271,10 @@ function parseClaude(records, fallbackId = "session") {
       }
     } else if (r.type === "attachment") {
       const a = r.attachment || {};
-      if (a.type === "queued_command" && a.isMeta !== true && (a.commandMode === void 0 || a.commandMode === "prompt") && typeof a.prompt === "string") {
+      const prompt = typeof a.prompt === "string" ? a.prompt : Array.isArray(a.prompt) ? a.prompt.filter((b) => b.type === "text").map((b) => str(b.text)).join("\n") : void 0;
+      if (a.type === "queued_command" && a.isMeta !== true && (a.commandMode === void 0 || a.commandMode === "prompt") && prompt !== void 0) {
         const o = a.origin;
-        if (!o || o.kind === void 0 || o.kind === "user" || o.kind === "human") pushPrompt(a.prompt, t, false);
+        if (!o || o.kind === void 0 || o.kind === "user" || o.kind === "human") pushPrompt(prompt, t, false, true);
       }
     }
   }
@@ -287,7 +288,7 @@ function parseClaude(records, fallbackId = "session") {
     addUsage(subagentUsage, usage);
     addUsage(subagentUsageByModel[model] ??= zero(), usage);
   }
-  function pushPrompt(text, t, isMeta) {
+  function pushPrompt(text, t, isMeta, queued = false) {
     if (isMeta) return;
     if (/^\s*\[Request interrupted by user/.test(text)) {
       events.push({ kind: "interrupt", t });
@@ -299,11 +300,11 @@ function parseClaude(records, fallbackId = "session") {
       const args2 = (text.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1] ?? "").trim();
       const name = cmd[1].trim();
       if (name === "plan") events.push({ kind: "plan_mode", t });
-      events.push({ kind: "prompt", t, text: `/${name} ${args2}`.trim(), slash: true });
+      events.push({ kind: "prompt", t, text: `/${name} ${args2}`.trim(), slash: true, ...queued ? { queued } : {} });
       return;
     }
     if (!text.trim()) return;
-    events.push({ kind: "prompt", t, text, slash: false });
+    events.push({ kind: "prompt", t, text, slash: false, ...queued ? { queued } : {} });
   }
   return {
     id,
@@ -338,6 +339,8 @@ function parseCodex(records, fallbackId = "session") {
   let curModel;
   const exitCodes = /* @__PURE__ */ new Map();
   const resultsById = /* @__PURE__ */ new Map();
+  let inTurn = false;
+  let turnBusy = false;
   for (const r of records) {
     const t = ts(r.timestamp);
     if (t) {
@@ -362,8 +365,20 @@ function parseCodex(records, fallbackId = "session") {
     if (r.type === "event_msg") {
       if (ptype === "user_message") {
         const text = str(p.message);
-        if (text.trim() && !isSyntheticPrompt(text)) events.push({ kind: "prompt", t, text, slash: text.trimStart().startsWith("/") });
+        if (text.trim() && !isSyntheticPrompt(text)) {
+          const queued = inTurn && turnBusy;
+          events.push({ kind: "prompt", t, text, slash: text.trimStart().startsWith("/"), ...queued ? { queued } : {} });
+          turnBusy = true;
+        }
+      } else if (ptype === "task_started" || ptype === "turn_started") {
+        inTurn = true;
+        const last = events.at(-1);
+        turnBusy = false;
+        if (last?.kind === "prompt" && t - last.t < 5e3) turnBusy = true;
+      } else if (ptype === "task_complete" || ptype === "turn_complete") {
+        inTurn = false;
       } else if (ptype === "turn_aborted") {
+        inTurn = false;
         events.push({ kind: "interrupt", t });
       } else if (ptype === "token_count") {
         const info = p.info || {};
@@ -409,6 +424,7 @@ function parseCodex(records, fallbackId = "session") {
       continue;
     }
     if (r.type === "response_item") {
+      if (inTurn && (p.role === "assistant" || ptype !== "message")) turnBusy = true;
       if (ptype === "message" && p.role === "assistant") {
         const parts = Array.isArray(p.content) ? p.content : [];
         lastAssistant = { kind: "assistant", t, model: curModel, toolCount: 0, text: parts.map((x) => str(x.text)).join("").slice(0, 2e3) };
@@ -885,9 +901,344 @@ function apiCost(byModel) {
   return { usd: families.reduce((a, f) => a + f.usd, 0), families, unpricedTokens, unpricedModels };
 }
 
+// src/lib/analyzer/runs.ts
+var BREAK_MS = 10 * 60 * 1e3;
+var isAgent = (e) => e.kind === "assistant" || e.kind === "tool" || e.kind === "tool_result";
+function sessionTiming(events) {
+  const ord = events.filter((e) => e.t).sort((a, b) => a.t - b.t);
+  const resultAt = /* @__PURE__ */ new Map();
+  ord.forEach((e, i) => {
+    if (e.kind === "tool_result" && !resultAt.has(e.id)) resultAt.set(e.id, i);
+  });
+  const nextInterrupt = new Array(ord.length + 1).fill(Infinity);
+  for (let i = ord.length - 1; i >= 0; i--) nextInterrupt[i] = ord[i].kind === "interrupt" ? i : nextInterrupt[i + 1];
+  const runs = [];
+  const waits = [];
+  const queued = /* @__PURE__ */ new Set();
+  let run = null;
+  let stoppedAt = -1;
+  const inFlight = /* @__PURE__ */ new Set();
+  const close = (end, interrupted) => {
+    if (run && end > run.start) {
+      runs.push({ start: run.start, end, queued: run.queued, interrupted });
+      stoppedAt = end;
+    }
+    run = null;
+    inFlight.clear();
+  };
+  for (let i = 0; i < ord.length; i++) {
+    const e = ord[i];
+    if (e.kind === "prompt") {
+      if (run) {
+        const toolRunning = [...inFlight].some((id) => (resultAt.get(id) ?? -1) > i && nextInterrupt[i] > resultAt.get(id));
+        if (e.queued || toolRunning) {
+          run.queued++;
+          queued.add(e);
+          continue;
+        }
+        close(run.last, false);
+      }
+      if (stoppedAt >= 0) waits.push(e.t - stoppedAt);
+      stoppedAt = -1;
+      run = { start: e.t, last: e.t, queued: 0 };
+    } else if (e.kind === "interrupt") {
+      if (run) close(Math.max(run.last, e.t), true);
+    } else if (isAgent(e) && run) {
+      run.last = e.t;
+      if (e.kind === "tool") inFlight.add(e.id);
+      else if (e.kind === "tool_result") inFlight.delete(e.id);
+    }
+  }
+  if (run) close(run.last, false);
+  return { runs, waits, queued };
+}
+function medianOf(xs) {
+  if (!xs.length) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+// src/lib/analyzer/specificity.ts
+var FENCE_RE = /```[\s\S]*?(```|$)/g;
+var INLINE_CODE_RE = /`[^`\n]{1,200}`/g;
+var URL_RE = /\bhttps?:\/\/\S+/gi;
+var PATH_G = new RegExp(PATH_RE.source, "g");
+var IDENT_RE = /\b([a-z]+[A-Z]\w*|[A-Z][a-z]+[A-Z]\w*|[a-z]+_[a-z_\d]+|[A-Z]{2,}_[A-Z_\d]+|\w+\(\))|(^|\s)--[a-z][\w-]+|(^|\s)\.[a-z]\w+\(/g;
+var ERROR_RE = /\b(\w*Error|Exception|Traceback|panicked|segfault|ENOENT|EADDRINUSE|ECONNREFUSED|exit code \d+|status (code )?\d{3}|HTTP \d{3}|\d{3} (error|response)|stack ?trace)\b|^\s*at \S+ \(.*:\d+:\d+\)|error TS\d+|\bFAIL\b/m;
+var LINE_REF_RE = /\b(line|lines|L)\s?\d+\b|:\d+(:\d+)?\b/;
+var QUOTED_RE = /"[^"\n]{3,120}"|'[^'\n]{3,120}'|“[^”\n]{3,120}”/;
+function prose(text) {
+  return text.replace(FENCE_RE, " ").replace(/<[^>]{1,200}>/g, " ");
+}
+var wordsOf = (s) => s.toLowerCase().match(/[a-z0-9][a-z0-9'_-]*/g) ?? [];
+var APPROVAL_RE = /^(ok(ay)?|k|yes|yep|yeah|yup|sure|lgtm|looks good|sounds good|good|great|perfect|nice|cool|thanks?|thank you|ty|go( ahead| for it| on)?|continue|proceed|carry on|keep going|do it|ship it|approved?|i approved|confirmed?|done|deploy|merge( it)?|commit( it)?|push( it)?|next|y|right|exactly|correct|agreed|both|all of (them|the above))\b/i;
+var QUESTION_START_RE = /^(why|how|what|where|when|which|who|is|are|was|were|does|do|did|should|would|could|will|has|have|can (i|we|it|this|that|you (see|tell|explain|confirm|check whether)))\b/i;
+var REQUEST_RE = /\b(can|could|would|will) you (please )?(also )?(add|make|change|update|fix|remove|delete|create|build|write|implement|refactor|rename|move|put|take|set|try|run|help|look|investigate|redo|show|give)\b|\b(please|let'?s|i want|i'd like|we need|i need)\b/i;
+function kindOf(p, words) {
+  const t = p.trim().replace(/^[\s,.!-]+/, "");
+  if (words.length <= 8 && APPROVAL_RE.test(t) && !TASK_VERB_RE.test(t.replace(APPROVAL_RE, ""))) return "approval";
+  if (/\?\s*$/.test(t) && QUESTION_START_RE.test(t) && !REQUEST_RE.test(t)) return "question";
+  return "task";
+}
+var TASK_VERB_RE = /\b(add|implement|build|create|write|fix|refactor|rename|remove|delete|drop|update|change|make|move|migrate|support|handle|set ?up|deploy|optimi[sz]e|improve|clean ?up|convert|port|replace|extract|debug|investigate|look into|figure out|find out|test|split|merge|wire|hook|expose|show|hide|display|render|allow|prevent|validate|parse|generate|redesign|rewrite|upgrade|bump|document|speed up|reduce|increase|limit|cache|log|track|send|store|load|fetch|sort|filter|group|center|align|style|resize|rotate|animate|translate)\b/i;
+var OUTCOME_RE = /\b(i want|i'd like|i would like|we want|we need|i need|the goal|goal is|our goal|so that|in order to|so (users?|people|we|i|it|they) (can|could|don'?t|won'?t)|(users?|people|visitors|customers) (can|should|need|want)|should be able to|the (point|idea|aim|purpose) is|we'?re trying to|i'?m trying to|the problem is|because|objective|use case|for (users|people) to)\b/i;
+var DEICTIC_OBJ_RE = /^(this|that|it|these|those|them|the (issue|problem|bug|error|thing|stuff|one))$/i;
+var CRITERIA_SIGNALS = [
+  ["tests", /\b(tests?|specs?) (must |should |all )?(pass|passing|green)|\b(make|get|keep) (the )?(tests?|ci|build) (pass|green)|\buntil (the )?(tests?|it|build) pass|\b(add|write|with|include) (a |an |some |unit |integration |e2e )?(tests?|test cases?|specs?)\b|\btest (for|that|it)\b/i],
+  ["expect", /\bshould (return|output|print|equal|be|show|display|render|include|contain|have|accept|reject|throw|fail|pass|allow|block|take|load|work when|look like|match|stay|remain|not)\b|\bexpect(ed|s)?\b|\bmust (not )?(be|return|have|pass|include|work|stay|handle|support)\b|\binstead of\b.{0,40}\b(show|return|display)/i],
+  ["done", /\b(done when|definition of done|acceptance criteria|acceptance test|success (criteria|looks like)|it'?s done|finished when|until it|you'?re done when)\b/i],
+  ["example", /\b(e\.g\.|for example|for instance|example:|such as|like this:)|(->|=>|→)\s*\S|\bgiven\b.{1,80}\b(then|return|expect)/i],
+  ["verify", /\b(make sure|ensure|verify|confirm (that|it)|check (that|it)|double[- ]check|without breaking|no regressions?|don'?t break|still (work|pass)s?)\b/i],
+  ["limits", /\b(at most|at least|no more than|fewer than|less than|under|within|below|above|max(imum)?|min(imum)?)\s+\d|\b\d+(\.\d+)?\s?(ms|s|sec|seconds|minutes|mb|kb|gb|%|px|req\/\w+|requests?|rps|items|rows|chars|characters|lines)\b|\b(status|return|respond with|returns?)\s+\d{3}\b/i],
+  ["edge", /\bedge cases?|corner cases?|empty (input|list|string|array)|null (input|values?)|invalid (input|dates?|values?)|when (it'?s|the input is) (empty|missing|null)/i]
+];
+var HOW_SIGNALS = [
+  ["line", /\b(on |at |in )?line\s?\d+\b|\blines? \d+\s?(-|to)\s?\d+/i],
+  ["replace", /\b(change|replace|swap|rename|set)\s+[`'"]?[\w.$()[\]-]+[`'"]?\s+(to|with|into|=)\s+[`'"]?[\w.$()[\]-]+/i],
+  ["use", /\buse\s+[`'"]?[\w.@/-]+[`'"]?\s+instead of\b|\b(call|invoke)\s+`?\w+(\(\))?`?\s+(from|in|inside|before|after)\b/i],
+  ["insert", /\b(add|insert|put|append|prepend)\s+(a |an |the )?(line|import|call|param(eter)?|argument|field|column|prop(erty)?|method|function|class|variable|const|check|if|guard|try|catch|return|key|attribute|flag)\b.{0,60}\b(to|in|into|at|before|after|inside)\b/i],
+  ["wrap", /\b(wrap|move|extract|inline|hoist)\s+[`'"]?[\w.$()-]+[`'"]?\s+(in|into|to|out of|from)\b/i],
+  ["sequence", /\b(first|step 1|1\.)\b[\s\S]{3,200}\b(then|next|after that|step 2|2\.)\b[\s\S]{3,200}\b(then|finally|lastly|step 3|3\.)\b/i],
+  ["code", /\b(like this|as follows|this code|the following code|paste this|exactly this)\s*:?\s*$/im]
+];
+var STEP_LINE_RE = /^\s*(\d+[.)]|[-*•])\s+(add|change|replace|rename|move|create|delete|remove|set|update|call|use|import|wrap|extract|insert|put|make|write|run|edit|open|modify)\b/gim;
+var VAGUE_PATTERNS = [
+  ["deictic-fix", /\b(fix|solve|sort out|handle|repair|debug|redo|do|change|update|improve|clean up|look at|check)\s+(this|that|it|these|those|them|the (issue|problem|bug|error|thing|stuff))\b/i],
+  ["make-it-work", /\bmake (it|this|that|them) (work|right|better|good|nicer|correct|pass)\b/i],
+  ["still-broken", /\b(it'?s |it is |that'?s |this is )?still (broken|failing|not working|doesn'?t work|wrong|bad|the same|happening|there|an issue|a problem|not fixed|not right|off)\b|^\s*still\W*$/i],
+  ["doesnt-work", /\b(it|this|that)(\s+(still|just))? (doesn'?t|does not|isn'?t|is not|didn'?t|did not|won'?t) (work|working|load|run)\b|^\s*(doesn'?t|not|didn'?t) work(ing)?\b|\b(it'?s|this is|that'?s) (broken|wrong|not working)\b/i],
+  ["try-again", /^\s*(try again|again|retry|one more time|redo( it)?|nope|wrong|no+)\W*$/i],
+  ["same-issue", /\b(same|similar) (issue|problem|error|thing|bug)\b|\bthe (issue|problem|error|bug) (is )?(still|persists)\b/i],
+  ["bare-fix", /^\s*(please\s+)?(fix|fix it|fix pls|fix please|make it work|do it properly|do better)\W*$/i]
+];
+var VAGUE_LEXICON = new Set(
+  "this that it its these those them the a an thing things stuff issue issues problem problems bug bugs error errors one ones fix fixed fixing make made work works working worked doesn't doesnt does not isn't isnt didn't didnt won't still again please pls just now ok okay so and but no nope yes wrong broken failing fail fails bad same similar there here try retry redo do done is was are be been can you could would should i we me my right better good properly anymore yet any some something somehow way also even really very too as to of in on for with at up out off".split(/\s+/)
+);
+var REDO_RE = /^\s*(no+\b|nope|wrong|incorrect|undo|revert|roll ?back|not (that|this|it|quite|what)|that'?s (not|wrong|incorrect)|this (is|isn'?t) (wrong|right|it)|still\b|actually,? (no|that|it|you)|wait,? (no|that|you))|\bi (meant|said|asked( for| you)?)\b|\bnot what i (meant|asked|wanted|said)\b|\bthat'?s not (it|right|what)\b|\byou (broke|missed|forgot|ignored|didn'?t)\b|\b(wrong|the other) (file|one|place|thing|element|button|function|component|page|section|field)\b|\b(try|do it) again\b|\bstill (broken|failing|not|wrong|the same|bad|doesn'?t|looks|there|happening)\b|\b(doesn'?t|didn'?t|does not|did not|isn'?t|still not) (work|fix|change|help|look right)\b|\bsame (issue|problem|error|bug)\b|\b(undo|revert) (that|this|it|the|your|those|these)\b|\bput it back\b|\bgo back to\b/i;
+var DIRECTION_RE = /\b(on second thought|changed my mind|change of plan|new requirement|let'?s (instead|try|go with|switch|change|do)|instead,? let'?s|actually,? let'?s|what if we|i'?ve decided|i decided|now that i see|seeing (it|this)|after seeing|scratch that,? (let'?s|we)|i'?d rather|let'?s rather|pivot)\b/i;
+var ALSO_RE = /^\s*(also|and also|additionally|now|next|then|ok(ay)?,? now|great,? now|thanks!? now|can you also|could you also|one more thing)\b/i;
+var OPENING_CHARS = 240;
+var level = (n, two) => n >= two ? 2 : n >= 1 ? 1 : 0;
+function promptSpec(text) {
+  const fences = text.match(FENCE_RE) ?? [];
+  const p = prose(text);
+  const words = wordsOf(p);
+  const kind = kindOf(p, words);
+  const inline = p.match(INLINE_CODE_RE) ?? [];
+  const plain = p.replace(INLINE_CODE_RE, " ").replace(URL_RE, " ");
+  const paths = (plain.match(PATH_G) ?? []).length;
+  const idents = (plain.match(IDENT_RE) ?? []).length;
+  const urls = (p.match(URL_RE) ?? []).length;
+  const errorPaste = ERROR_RE.test(text) && (fences.length > 0 || text.split("\n").length >= 3 || /\b\w*Error:|Traceback/.test(text));
+  const codeFence = fences.some((f) => f.split("\n").length >= 3);
+  const lineRef = LINE_REF_RE.test(plain);
+  const quoted = QUOTED_RE.test(plain);
+  const refs = paths + idents + inline.length + urls + fences.length + (lineRef ? 1 : 0) + (quoted ? 1 : 0) + (errorPaste ? 1 : 0);
+  const context = errorPaste || codeFence ? 2 : level(refs, 3);
+  const crit = CRITERIA_SIGNALS.filter(([, re]) => re.test(p)).map(([k]) => k);
+  const criteria = kind === "task" ? level(crit.length + (crit.includes("done") ? 1 : 0), 2) : 0;
+  const steps = (p.match(STEP_LINE_RE) ?? []).length;
+  const how = HOW_SIGNALS.filter(([, re]) => re.test(p)).length + (fences.length && !errorPaste && /\b(add|use|change|replace|like|to|with)\b[^.\n]{0,40}:?\s*$/im.test(p.split("```")[0] ?? "") ? 1 : 0);
+  const prescriptive = kind !== "task" ? 0 : steps >= 2 ? 2 : level(how, 2);
+  const vagueBy = kind === "task" ? VAGUE_PATTERNS.filter(([, re]) => re.test(p)).map(([k]) => k) : [];
+  const content = words.filter((w) => !VAGUE_LEXICON.has(w) && w.length > 1);
+  const anchored = refs > 0;
+  const vague = vagueBy.length > 0 && !anchored && words.length <= 15 && content.length <= 3;
+  const verb = TASK_VERB_RE.exec(p);
+  let goal = 0;
+  if (kind === "task" && !vague) {
+    const after = verb ? wordsOf(p.slice(verb.index + verb[0].length)).filter((w) => !/^(the|a|an|me|us|please|also|now|it)$/.test(w)) : [];
+    const objectNamed = verb ? after.length > 0 && !(after.length <= 2 && DEICTIC_OBJ_RE.test(after.join(" "))) : false;
+    if (OUTCOME_RE.test(p) && words.length >= 6) goal = 2;
+    else if (objectNamed || words.length >= 12) goal = 1;
+    if (goal === 1 && criteria >= 1 && words.length >= 10) goal = 2;
+  }
+  const opening = p.trim().slice(0, OPENING_CHARS);
+  const correction = kind !== "approval" && REDO_RE.test(opening);
+  const newDirection = DIRECTION_RE.test(opening) || !correction && ALSO_RE.test(opening);
+  let style = "none";
+  if (kind === "task") {
+    if (vague) style = "vague";
+    else if (prescriptive === 2) style = "prescriptive";
+    else if (goal >= 1 && criteria >= 1) style = "outcome";
+    else if (context >= 1) style = "contextual";
+    else style = "bare";
+  }
+  return { kind, words: words.length, goal, criteria, context, prescriptive, vague, vagueBy, correction, newDirection, style };
+}
+var emptySpecificity = () => ({ taskPrompts: 0, vaguePrompts: 0, goalPrompts: 0, criteriaPrompts: 0, contextPrompts: 0, prescriptivePrompts: 0, outcomeBriefs: 0 });
+function specificityCounts(events, into = emptySpecificity()) {
+  for (const e of events) {
+    if (e.kind !== "prompt" || e.slash) continue;
+    const s = promptSpec(e.text);
+    if (s.vague) into.vaguePrompts++;
+    if (s.kind !== "task") continue;
+    into.taskPrompts++;
+    if (s.goal === 2) into.goalPrompts++;
+    if (s.criteria >= 1) into.criteriaPrompts++;
+    if (s.context >= 1) into.contextPrompts++;
+    if (s.prescriptive === 2) into.prescriptivePrompts++;
+    if (s.style === "outcome") into.outcomeBriefs++;
+  }
+  return into;
+}
+
+// src/lib/analyzer/churn.ts
+var emptyChurn = () => ({ workTurns: 0, redoCycles: 0, avoidableRedos: 0, vagueRedos: 0, redoTokens: 0, redoMinutes: 0, workTokens: 0 });
+var IDLE_GAP_MS = 10 * 60 * 1e3;
+var STOP = new Set("the a an to of in on for and or but with this that it is are be can you please i we me my just now also so then do make add".split(" "));
+var contentWords = (s) => new Set((s.toLowerCase().match(/[a-z0-9_]{3,}/g) ?? []).filter((w) => !STOP.has(w)));
+function jaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let n = 0;
+  for (const x of a) if (b.has(x)) n++;
+  return n / (a.size + b.size - n);
+}
+var linesOf = (s) => (s ?? "").split("\n").map((l) => l.trim()).filter((l) => l.length >= 8 && !/^[\s{}()[\];,]*$/.test(l));
+var editFiles = (e) => e.paths?.length ? e.paths : e.path ? [e.path] : [];
+var GIT_REVERT_RE = /\bgit\s+(checkout\s+(--\s+)?\S*\.\w+|checkout\s+--\s|restore\b|reset\s+--hard|revert\b)/;
+var REVERT_ASK_RE = /\b(undo|revert|roll ?back|put (it|that|them) back|go back to|restore (the|it|what))\b/i;
+var WRONG_TARGET_RE = /\b(not (that|this) (one|file|function|button|page|component|section|thing|part)|wrong (file|one|place|thing|element|button|function|component|page|section|field)|the other (one|file|button|page)|i (meant|was talking about|'m talking about)|not what i (meant|asked))\b/i;
+var ERROR_TEXT_RE = /\b(\w*Error|exception|traceback|crash(es|ed)?|throws?|fail(s|ed|ing)?|500|undefined is not|cannot find|is not defined|still (broken|failing|not working)|(doesn'?t|does not|isn'?t|not) working|doesn'?t work)\b/i;
+var continues = (s) => s.kind === "approval";
+function turnsOf(events) {
+  const results = /* @__PURE__ */ new Map();
+  for (const e of events) if (e.kind === "tool_result" && !results.has(e.id)) results.set(e.id, e);
+  const turns = [];
+  let cur = null;
+  let lastAgent = 0;
+  let active = 0;
+  const failing = /* @__PURE__ */ new Map();
+  const close = () => {
+    if (!cur) return;
+    cur.minutes = active / 6e4;
+    cur.endedBadly = cur.endedBadly || [...failing.values()].some(Boolean);
+    failing.clear();
+  };
+  events.forEach((e, i) => {
+    if (e.kind === "prompt") {
+      if (e.slash) return;
+      const spec = promptSpec(e.text);
+      if (cur && continues(spec)) return;
+      close();
+      cur = { i, t: e.t, spec, words: contentWords(e.text), files: /* @__PURE__ */ new Set(), edits: [], gitRevert: false, endedBadly: false, tokens: 0, minutes: 0 };
+      lastAgent = e.t;
+      active = 0;
+      turns.push(cur);
+      return;
+    }
+    if (!cur) return;
+    const c = cur;
+    if (e.t && lastAgent && e.t > lastAgent && e.t - lastAgent < IDLE_GAP_MS) active += e.t - lastAgent;
+    if (e.t) lastAgent = Math.max(lastAgent, e.t);
+    if (e.kind === "assistant") {
+      if (e.usage) c.tokens += e.usage.input + e.usage.cacheWrite + e.usage.output;
+    } else if (e.kind === "tool") {
+      const res = results.get(e.id);
+      if (res?.rejected) c.endedBadly = true;
+      if (e.category === "edit") {
+        if (res?.isError) return;
+        c.edits.push(e);
+        for (const f of editFiles(e)) c.files.add(f);
+        for (const f of e.deleted ?? []) c.files.add(f);
+      } else if (e.category === "git" || e.category === "exec") {
+        if (GIT_REVERT_RE.test(e.detail)) c.gitRevert = true;
+      }
+      if (["exec", "test", "build"].includes(e.category) && res && !res.rejected) {
+        const kind = checkCommand(e.detail)?.kind ?? e.detail.split(/\s+/).slice(0, 2).join(" ");
+        failing.set(kind, res.isError);
+      }
+    }
+  });
+  close();
+  return turns;
+}
+var isWork = (t) => t.edits.length > 0 || t.gitRevert;
+function sessionChurn(events) {
+  const turns = turnsOf(events);
+  const cycles = [];
+  const written = /* @__PURE__ */ new Map();
+  const removed = /* @__PURE__ */ new Map();
+  const work = [];
+  turns.forEach((t, k) => {
+    if (!isWork(t)) return;
+    const prior = work.slice(-3);
+    if (prior.length) {
+      let origin = prior[prior.length - 1];
+      for (let j = prior.length - 1; j >= 0; j--) if ([...turns[prior[j]].files].some((f) => t.files.has(f))) {
+        origin = prior[j];
+        break;
+      }
+      let overwrote = false;
+      let restored = false;
+      for (const e of t.edits)
+        for (const f of editFiles(e)) {
+          const w = written.get(f);
+          const r = removed.get(f);
+          const old = linesOf(e.old);
+          const neu = linesOf(e.written);
+          if (w && old.some((l) => w.has(l))) overwrote = true;
+          if (w && r && old.length && neu.length && old.filter((l) => w.has(l)).length / old.length >= 0.6 && neu.filter((l) => r.has(l)).length / neu.length >= 0.6) restored = true;
+        }
+      const s = t.spec;
+      const repeat = turns.slice(Math.max(0, k - 5), k).some((p) => t.words.size >= 3 && jaccard(t.words, p.words) >= 0.6);
+      const revert = REVERT_ASK_RE.test(promptText(events, t)) || restored || t.gitRevert && s.correction;
+      const trigger = revert ? "revert" : s.correction ? "correction" : repeat ? "repeat" : overwrote ? "overwrite" : null;
+      if (trigger) {
+        const text = promptText(events, t);
+        const kind = trigger === "overwrite" || s.newDirection && !WRONG_TARGET_RE.test(text) ? "iteration" : "avoidable";
+        const before = turns[k - 1];
+        const cause = kind === "iteration" ? null : WRONG_TARGET_RE.test(text) ? "wrong-target" : before?.endedBadly || turns[origin].endedBadly || ERROR_TEXT_RE.test(text) ? "agent-error" : "underspecified";
+        cycles.push({
+          turn: k,
+          origin,
+          trigger,
+          kind,
+          cause,
+          originVague: turns[origin].spec.vague,
+          triggerVague: s.vague,
+          files: [...t.files].slice(0, 8),
+          tokens: t.tokens,
+          minutes: Math.round(t.minutes * 10) / 10
+        });
+      }
+    }
+    work.push(k);
+    for (const e of t.edits)
+      for (const f of editFiles(e)) {
+        const w = written.get(f) ?? /* @__PURE__ */ new Map();
+        const r = removed.get(f) ?? /* @__PURE__ */ new Map();
+        for (const l of linesOf(e.written)) w.set(l, k);
+        for (const l of linesOf(e.old)) r.set(l, k);
+        written.set(f, w);
+        removed.set(f, r);
+      }
+  });
+  return { turns, workTurns: work.length, cycles };
+}
+function promptText(events, t) {
+  const e = events[t.i];
+  return e.kind === "prompt" ? prose(e.text).trim().slice(0, OPENING_CHARS) : "";
+}
+function churnCounts(events, into = emptyChurn()) {
+  const c = sessionChurn(events);
+  into.workTurns += c.workTurns;
+  for (const t of c.turns) if (isWork(t)) into.workTokens += t.tokens;
+  for (const y of c.cycles) {
+    into.redoCycles++;
+    if (y.kind !== "avoidable") continue;
+    into.avoidableRedos++;
+    if (y.originVague) into.vagueRedos++;
+    into.redoTokens += y.tokens;
+    into.redoMinutes += y.minutes;
+  }
+  return into;
+}
+
 // src/lib/analyzer/metrics.ts
 var CATS = ["read", "search", "edit", "exec", "test", "build", "git", "web", "agent", "plan", "ask", "mcp", "other"];
-var IDLE_GAP_MS = 10 * 60 * 1e3;
+var IDLE_GAP_MS2 = 10 * 60 * 1e3;
 var TOKEN_FIELDS = ["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"];
 var noTokens = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 });
 var billed = (u) => {
@@ -958,6 +1309,9 @@ function computeMetrics(sessions, opts = {}) {
     agentBusyMinutes: 0,
     agentWaitMinutes: 0,
     agentTurns: 0,
+    queuedPrompts: 0,
+    agentWaits: 0,
+    agentBreaks: 0,
     humanCodeChars: 0,
     humanWords: 0,
     codeEditSessions: 0,
@@ -976,6 +1330,8 @@ function computeMetrics(sessions, opts = {}) {
     batchEdits: 0
   };
   const trusted = trustedChecks(sessions);
+  const briefs = emptySpecificity();
+  const churn = emptyChurn();
   const lessonTimeline = [];
   const promptLens = [];
   const sources = /* @__PURE__ */ new Set();
@@ -987,6 +1343,7 @@ function computeMetrics(sessions, opts = {}) {
   const tz = opts.tzOffsetMinutes ?? 0;
   const byModel = {};
   const promptsByDay = /* @__PURE__ */ new Map();
+  const waitsMs = [];
   const spans = [];
   for (const s of sessions) {
     const events = s.events.filter((e) => (!opts.since || e.t >= opts.since) && (!opts.until || e.t <= opts.until));
@@ -995,6 +1352,8 @@ function computeMetrics(sessions, opts = {}) {
     else addTokens(byModel, s.models[0], s.subagentUsage);
     if (!events.length) continue;
     m.sessions++;
+    specificityCounts(events, briefs);
+    churnCounts(events, churn);
     {
       const o = sessionOutcome(s.id, events, trusted);
       if (o.codeEdits > 0) {
@@ -1025,13 +1384,13 @@ function computeMetrics(sessions, opts = {}) {
     let active = 0;
     for (let i = 1; i < times.length; i++) {
       const g = times[i] - times[i - 1];
-      if (g < IDLE_GAP_MS) active += g;
+      if (g < IDLE_GAP_MS2) active += g;
     }
     const activeMin = active / 6e4;
     if (events.some((e) => e.kind === "prompt") && times.length) {
       let a = times[0], b = times[0];
       for (let i = 1; i < times.length; i++) {
-        if (times[i] - b < IDLE_GAP_MS) b = times[i];
+        if (times[i] - b < IDLE_GAP_MS2) b = times[i];
         else {
           if (b > a) spans.push([a, b]);
           a = b = times[i];
@@ -1040,31 +1399,15 @@ function computeMetrics(sessions, opts = {}) {
       if (b > a) spans.push([a, b]);
     }
     m.activeMinutes += activeMin;
-    {
-      const ord = [...events].filter((e) => e.t).sort((a, b) => a.t - b.t);
-      let promptAt = -1;
-      let lastAgent = -1;
-      for (const e of ord) {
-        if (e.kind === "prompt") {
-          if (promptAt >= 0 && lastAgent > promptAt) {
-            m.agentBusyMinutes += (lastAgent - promptAt) / 6e4;
-            m.agentTurns++;
-            const wait = e.t - lastAgent;
-            if (wait > 0) m.agentWaitMinutes += Math.min(wait, IDLE_GAP_MS) / 6e4;
-          }
-          promptAt = e.t;
-          lastAgent = -1;
-        } else if (e.kind === "interrupt") {
-          if (promptAt >= 0) lastAgent = Math.max(lastAgent, e.t);
-        } else if (e.kind === "assistant" || e.kind === "tool" || e.kind === "tool_result") {
-          if (promptAt >= 0) lastAgent = e.t;
-        }
-      }
-      if (promptAt >= 0 && lastAgent > promptAt) {
-        m.agentBusyMinutes += (lastAgent - promptAt) / 6e4;
-        m.agentTurns++;
-      }
+    const timing = sessionTiming(events);
+    for (const r of timing.runs) m.agentBusyMinutes += (r.end - r.start) / 6e4;
+    m.agentTurns += timing.runs.length;
+    for (const w of timing.waits) {
+      m.agentWaitMinutes += Math.min(w, BREAK_MS) / 6e4;
+      if (w < BREAK_MS) waitsMs.push(w);
+      else m.agentBreaks++;
     }
+    for (const e of timing.queued) if (e.kind === "prompt" && !e.slash) m.queuedPrompts++;
     if (times.length) m.spanMinutes += (times[times.length - 1] - times[0]) / 6e4;
     m.longestSessionMinutes = Math.max(m.longestSessionMinutes, activeMin);
     const readPaths = /* @__PURE__ */ new Set();
@@ -1088,7 +1431,7 @@ function computeMetrics(sessions, opts = {}) {
     for (const e of events) {
       switch (e.kind) {
         case "prompt": {
-          closeTurn();
+          if (!timing.queued.has(e)) closeTurn();
           if (e.slash) {
             m.slashCommands++;
             if (/^\/(plan|ultraplan)/.test(e.text)) m.planEvents++;
@@ -1230,6 +1573,7 @@ function computeMetrics(sessions, opts = {}) {
   m.parallelMinutes = Math.round(par / 6e4 * 10) / 10;
   m.peakParallel = peak;
   m.lessonsCodified = codifiedLessons(lessonTimeline);
+  Object.assign(m, briefs, churn, { redoMinutes: Math.round(churn.redoMinutes * 10) / 10 });
   m.sources = [...sources];
   m.models = [...models];
   m.tokens.total = m.tokens.input + m.tokens.cacheRead + m.tokens.cacheWrite + m.tokens.output;
@@ -1243,6 +1587,8 @@ function computeMetrics(sessions, opts = {}) {
   m.activeMinutes = Math.round(m.activeMinutes * 10) / 10;
   m.agentBusyMinutes = Math.round(m.agentBusyMinutes * 10) / 10;
   m.agentWaitMinutes = Math.round(m.agentWaitMinutes * 10) / 10;
+  m.agentWaits = waitsMs.length;
+  m.agentWaitMedianMinutes = Math.round(medianOf(waitsMs) / 6e4 * 1e3) / 1e3;
   m.spanMinutes = Math.round(m.spanMinutes * 10) / 10;
   m.longestSessionMinutes = Math.round(m.longestSessionMinutes * 10) / 10;
   for (const t of Object.values(byModel)) for (const f of TOKEN_FIELDS) t[f] = Math.round(t[f]);
@@ -1282,88 +1628,149 @@ var duration = (mins) => {
   return h ? `${h} h${mm ? ` ${mm} min` : ""}` : `${t} min`;
 };
 var SIGNALS = [
-  { key: "verify", name: "Checks after edits", scale: 1e3, prior: [0.2, 0.55, 0.9], good: 1, value: (m) => per(m.verifiedEditTurns, m.editTurns, 2), fmt: pct, line: (v) => `You check the code after ${v} of your edits`, they: (v, w) => `${w} checks the code after ${v} of their edits` },
-  { key: "steps", name: "Agent steps per prompt", scale: 10, prior: [3, 8, 13], good: 1, value: (m) => per(m.toolCalls, m.humanTurns, 3), fmt: n1, line: (v) => `Your agent takes ${v} steps for every prompt that you write`, they: (v, w) => `${w}'s agent takes ${v} steps for every prompt that they write` },
-  { key: "words", name: "Words per prompt", scale: 10, prior: [15, 45, 80], value: (m) => per(m.humanWords, m.humanTurns, 3), fmt: n1, line: (v) => `Your prompts average ${v} words`, they: (v, w) => `${w}'s prompts average ${v} words` },
-  { key: "files", name: "Prompts naming a file", scale: 1e3, prior: [0.2, 0.33, 0.45], good: 1, value: (m) => per(m.promptsWithPaths, m.humanTurns, 3), fmt: pct, line: (v) => `${v} of your prompts name a specific file`, they: (v, w) => `${v} of ${w}'s prompts name a specific file` },
-  { key: "done", name: "Prompts defining done", scale: 1e3, prior: [0.12, 0.28, 0.45], good: 1, value: (m) => per(m.promptsWithCriteria, m.humanTurns, 3), fmt: pct, line: (v) => `${v} of your prompts describe what "done" looks like`, they: (v, w) => `${v} of ${w}'s prompts describe what "done" looks like` },
-  { key: "corrections", name: "Corrections", scale: 1e3, prior: [0.015, 0.08, 0.18], good: -1, value: (m) => per(m.corrections, m.humanTurns, 3), fmt: pct, line: (v) => `You correct the agent on ${v} of your prompts`, they: (v, w) => `${w} corrects the agent on ${v} of their prompts` },
-  { key: "interrupts", name: "Interrupts per 10 prompts", scale: 10, prior: [0.05, 0.3, 0.55], value: (m) => m.humanTurns >= 5 ? m.interrupts / m.humanTurns * 10 : null, fmt: n1, line: (v) => `You stop the agent mid-run ${v} times per 10 prompts`, they: (v, w) => `${w} stops the agent mid-run ${v} times per 10 prompts` },
-  { key: "reads", name: "Reads before editing", scale: 1e3, prior: [0.35, 0.6, 0.88], good: 1, value: (m) => m.editedFiles >= 2 ? m.readBeforeEditRatio : null, fmt: pct, line: (v) => `${v} of the files that you change are read first`, they: (v, w) => `${v} of the files that ${w} changes are read first` },
-  { key: "plans", name: "Plans before coding", scale: 1e3, prior: [0.1, 0.45, 0.8], good: 1, value: (m) => per(m.sessionsPlanFirst, m.sessionsWithEdits, 1), fmt: pct, line: (v) => `You plan before the first edit in ${v} of sessions`, they: (v, w) => `${w} plans before the first edit in ${v} of sessions` },
-  { key: "subagents", name: "Subagents per session", scale: 10, prior: [0, 0.25, 0.7], value: (m) => per(m.subagents, m.sessions, 1), fmt: n1, line: (v) => `You run ${v} subagents per session`, they: (v, w) => `${w} runs ${v} subagents per session` },
-  { key: "minutes", name: "Minutes per session", scale: 1, prior: [15, 40, 65], value: (m) => per(m.activeMinutes, m.sessions, 1), fmt: (v) => `${Math.round(v)} min`, line: (v) => `Your sessions average ${v} of active work`, they: (v, w) => `${w}'s sessions average ${v} of active work` },
-  { key: "pace", name: "Lines per hour", scale: 1, prior: [150, 650, 2300], value: (m) => wallHours(m) >= 1 / 6 ? m.linesWritten / wallHours(m) : null, fmt: (v) => big(v), line: (v) => `Your agents write ${v} lines per hour of your coding time`, they: (v, w) => `${w}'s agents write ${v} lines per hour of their coding time` },
+  // verify: Share. Agents now run tests and builds on their own far more than in 2024, so the middle moves up a little; Anthropic finds verified success in 15-33% of sessions by expertise [A2], so the low end stays low.
+  { key: "verify", name: "Checks after edits", scale: 1e3, prior: [0.25, 0.6, 0.92], good: 1, value: (m) => per(m.verifiedEditTurns, m.editTurns, 2), fmt: pct, line: (v) => `You check the code after ${v} of your edits`, they: (v, w) => `${w} checks the code after ${v} of their edits` },
+  // steps: Log. Anthropic: about 10 actions per prompt on average, about 12 for experts and 5 for novices, and 2% of sessions above 100 [A2]. Heavy users sit near the expert figure.
+  { key: "steps", name: "Agent steps per prompt", scale: 10, prior: [4, 12, 35], log: true, good: 1, value: (m) => per(m.toolCalls, m.humanTurns, 3), fmt: n1, line: (v) => `Your agent takes ${v} steps for every prompt that you write`, they: (v, w) => `${w}'s agent takes ${v} steps for every prompt that they write` },
+  // words: Log. The mean is pulled up by pasted specs, logs and errors; heavy users who write 150-250-word task briefs are common, so 150 is the 90th, not 80. No public figure for prompt length.
+  { key: "words", name: "Words per prompt", scale: 10, prior: [12, 45, 150], log: true, value: (m) => per(m.humanWords, m.humanTurns, 3), fmt: n1, line: (v) => `Your prompts average ${v} words`, they: (v, w) => `${w}'s prompts average ${v} words` },
+  // files: Share. No public data; widened from [0.2, 0.33, 0.45], which put ordinary variation in the tails.
+  { key: "files", name: "Prompts naming a file", scale: 1e3, prior: [0.12, 0.3, 0.55], good: 1, value: (m) => per(m.promptsWithPaths, m.humanTurns, 3), fmt: pct, line: (v) => `${v} of your prompts name a specific file`, they: (v, w) => `${v} of ${w}'s prompts name a specific file` },
+  // done: Share. No public data; widened slightly at the top.
+  { key: "done", name: "Prompts defining done", scale: 1e3, prior: [0.1, 0.28, 0.5], good: 1, value: (m) => per(m.promptsWithCriteria, m.humanTurns, 3), fmt: pct, line: (v) => `${v} of your prompts describe what "done" looks like`, they: (v, w) => `${v} of ${w}'s prompts describe what "done" looks like` },
+  // corrections: Share. Anthropic: internal users intervened 3.3 times per session, and missing context or corrections are 32% of interruptions [A1]. Barely changed.
+  { key: "corrections", name: "Corrections", scale: 1e3, prior: [0.02, 0.08, 0.2], good: -1, value: (m) => per(m.corrections, m.humanTurns, 3), fmt: pct, line: (v) => `You correct the agent on ${v} of your prompts`, they: (v, w) => `${w} corrects the agent on ${v} of their prompts` },
+  // interrupts: Log. Anthropic: people interrupt on about 5% of turns when new and about 9% when experienced [A1], i.e. 0.5-0.9 per 10 prompts, so the old middle of 0.3 was too low.
+  { key: "interrupts", name: "Interrupts per 10 prompts", scale: 10, prior: [0.1, 0.7, 2], log: true, value: (m) => m.humanTurns >= 5 ? m.interrupts / m.humanTurns * 10 : null, fmt: n1, line: (v) => `You stop the agent mid-run ${v} times per 10 prompts`, they: (v, w) => `${w} stops the agent mid-run ${v} times per 10 prompts` },
+  // reads: Share. Claude Code's Edit tool needs the file read first, so most Claude Code edits are read first; Codex patches and new files pull it down.
+  { key: "reads", name: "Reads before editing", scale: 1e3, prior: [0.35, 0.7, 0.95], good: 1, value: (m) => m.editedFiles >= 2 ? m.readBeforeEditRatio : null, fmt: pct, line: (v) => `${v} of the files that you change are read first`, they: (v, w) => `${v} of the files that ${w} changes are read first` },
+  // plans: Share. Plan mode is common among heavy users; little change.
+  { key: "plans", name: "Plans before coding", scale: 1e3, prior: [0.1, 0.45, 0.85], good: 1, value: (m) => per(m.sessionsPlanFirst, m.sessionsWithEdits, 1), fmt: pct, line: (v) => `You plan before the first edit in ${v} of sessions`, they: (v, w) => `${w} plans before the first edit in ${v} of sessions` },
+  // subagents: Log. Claude Code starts Explore and Plan subagents on its own and heavy users run their own, while Codex sessions and quick questions have none. 3-8 per session is a strong but normal heavy user (84-97).
+  { key: "subagents", name: "Subagents per session", scale: 10, prior: [0, 1, 3.5], log: true, value: (m) => per(m.subagents, m.sessions, 1), fmt: n1, line: (v) => `You run ${v} subagents per session`, they: (v, w) => `${w} runs ${v} subagents per session` },
+  // minutes: Log. Active minutes (gaps over 10 min dropped). Typical sessions are short (about 4 prompts [A2]; about 23 min on average [S2]), but heavy users run multi-hour sessions and the longest turns now pass 45 min [A1]. 2-4 hour sessions land at 90-96.
+  { key: "minutes", name: "Minutes per session", scale: 1, prior: [10, 40, 120], log: true, value: (m) => per(m.activeMinutes, m.sessions, 1), fmt: (v) => `${Math.round(v)} min`, line: (v) => `Your sessions average ${v} of active work`, they: (v, w) => `${w}'s sessions average ${v} of active work` },
+  // pace: Log. Heavy users with parallel agents write thousands of lines per hour; the old 90th of 2,300 was a single-session figure.
+  { key: "pace", name: "Lines per hour", scale: 1, prior: [150, 800, 4e3], log: true, value: (m) => wallHours(m) >= 1 / 6 ? m.linesWritten / wallHours(m) : null, fmt: (v) => big(v), line: (v) => `Your agents write ${v} lines per hour of your coding time`, they: (v, w) => `${w}'s agents write ${v} lines per hour of their coding time` },
+  // night: Share. Unchanged: no new evidence.
   { key: "night", name: "Prompts after 11pm", scale: 1e3, prior: [0, 0.05, 0.35], fun: true, value: (m) => per(m.nightOwlShare * m.humanTurns, m.humanTurns, 5), fmt: pct, line: (v) => `${v} of your prompts are sent after 11pm`, they: (v, w) => `${v} of ${w}'s prompts are sent after 11pm` },
+  // please: Rate per prompt. Unchanged: no new evidence.
   { key: "please", name: "Pleases and thanks", scale: 1e3, prior: [0.05, 0.3, 0.55], fun: true, value: (m) => per(m.politeness, m.humanTurns, 5), fmt: (v) => n1(v * 10), line: (v) => `You say please or thanks ${v} times per 10 prompts`, they: (v, w) => `${w} says please or thanks ${v} times per 10 prompts` },
   // time and parallel work; per-hour measures use wall-clock time, so running sessions side by side counts once
-  { key: "hours", name: "Hours coding with agents", scale: 10, prior: [3, 15, 50], value: (m) => wallHours(m) > 0 ? wallHours(m) : null, fmt: n1, line: (v) => `You spent ${v} hours coding with agents in these sessions`, they: (v, w) => `${w} spent ${v} hours coding with agents in these sessions` },
-  { key: "concurrency", name: "Sessions running at once", scale: 100, prior: [1, 1.1, 1.7], value: (m) => m.wallMinutes && m.wallMinutes >= 30 ? m.activeMinutes / m.wallMinutes : null, fmt: (v) => v.toFixed(1), line: (v) => `You have ${v} sessions running on average while you work`, they: (v, w) => `${w} has ${v} sessions running on average while they work` },
-  { key: "parallel", name: "Time with parallel sessions", scale: 1e3, prior: [0, 0.08, 0.4], value: (m) => m.wallMinutes && m.wallMinutes >= 30 ? (m.parallelMinutes ?? 0) / m.wallMinutes : null, fmt: pct, line: (v) => `${v} of your coding time has two or more sessions running`, they: (v, w) => `${v} of ${w}'s coding time has two or more sessions running` },
-  { key: "peak", name: "Most sessions at once", scale: 1, prior: [1, 2, 4], value: (m) => m.peakParallel ? m.peakParallel : null, fmt: (v) => String(Math.round(v)), line: (v) => `You ran up to ${v} sessions at the same time`, they: (v, w) => `${w} ran up to ${v} sessions at the same time` },
-  { key: "promptsHour", name: "Prompts per hour", scale: 10, prior: [4, 10, 25], value: (m) => wallHours(m) >= 0.5 ? m.humanTurns / wallHours(m) : null, fmt: n1, line: (v) => `You send ${v} prompts per hour of coding`, they: (v, w) => `${w} sends ${v} prompts per hour of coding` },
-  { key: "tokensLine", name: "Tokens per line written", scale: 1, prior: [800, 4e3, 2e4], value: (m) => m.linesWritten >= 20 ? (m.tokens.input + m.tokens.cacheWrite + m.tokens.output + m.tokens.subagent) / m.linesWritten : null, fmt: big, line: (v) => `Your agents use ${v} tokens for each line that they write`, they: (v, w) => `${w}'s agents use ${v} tokens for each line that they write` },
+  // hours: Log. Total wall-clock hours in the upload. Anthropic: people use Claude Code about 20 hours a week [A2], and Claude Code keeps 30 days of transcripts by default [D1], so a heavy month is 25-100 hours.
+  { key: "hours", name: "Hours coding with agents", scale: 10, prior: [4, 25, 100], log: true, value: (m) => wallHours(m) > 0 ? wallHours(m) : null, fmt: n1, line: (v) => `You spent ${v} hours coding with agents in these sessions`, they: (v, w) => `${w} spent ${v} hours coding with agents in these sessions` },
+  // concurrency: Log. Heavy users run worktrees and several sessions side by side; the old 90th of 1.7 was a single-window user.
+  { key: "concurrency", name: "Sessions running at once", scale: 100, prior: [1, 1.2, 2.2], log: true, value: (m) => m.wallMinutes && m.wallMinutes >= 30 ? m.activeMinutes / m.wallMinutes : null, fmt: (v) => v.toFixed(1), line: (v) => `You have ${v} sessions running on average while you work`, they: (v, w) => `${w} has ${v} sessions running on average while they work` },
+  // parallel: Share. As concurrency: parallel sessions are now normal for heavy users.
+  { key: "parallel", name: "Time with parallel sessions", scale: 1e3, prior: [0, 0.15, 0.6], value: (m) => m.wallMinutes && m.wallMinutes >= 30 ? (m.parallelMinutes ?? 0) / m.wallMinutes : null, fmt: pct, line: (v) => `${v} of your coding time has two or more sessions running`, they: (v, w) => `${v} of ${w}'s coding time has two or more sessions running` },
+  // peak: Log. Over a month of uploads most heavy users have three sessions open at some point; 8 or more is rare.
+  { key: "peak", name: "Most sessions at once", scale: 1, prior: [1, 3, 8], log: true, value: (m) => m.peakParallel ? m.peakParallel : null, fmt: (v) => String(Math.round(v)), line: (v) => `You ran up to ${v} sessions at the same time`, they: (v, w) => `${w} ran up to ${v} sessions at the same time` },
+  // promptsHour: Log. Parallel sessions raise prompts per wall-clock hour; the old 90th of 25 was one window.
+  { key: "promptsHour", name: "Prompts per hour", scale: 10, prior: [5, 14, 40], log: true, value: (m) => wallHours(m) >= 0.5 ? m.humanTurns / wallHours(m) : null, fmt: n1, line: (v) => `You send ${v} prompts per hour of coding`, they: (v, w) => `${w} sends ${v} prompts per hour of coding` },
+  // tokensLine: Log. Input, cache writes, output and subagent tokens (not cache reads) per line. Long sessions with subagents read far more than they write: a median agent request carries about 96k input tokens [S1], and agent teams use about 7x the tokens [D1].
+  { key: "tokensLine", name: "Tokens per line written", scale: 1, prior: [1500, 1e4, 5e4], log: true, value: (m) => m.linesWritten >= 20 ? (m.tokens.input + m.tokens.cacheWrite + m.tokens.output + m.tokens.subagent) / m.linesWritten : null, fmt: big, line: (v) => `Your agents use ${v} tokens for each line that they write`, they: (v, w) => `${w}'s agents use ${v} tokens for each line that they write` },
   // who waits on whom: parallel sessions only help if each agent is kept busy with substantive work
-  { key: "workPerPrompt", name: "Agent work per prompt", scale: 100, prior: [0.3, 1.5, 6], good: 1, value: (m) => m.agentTurns && m.agentTurns >= 3 ? (m.agentBusyMinutes ?? 0) / m.agentTurns : null, fmt: (v) => `${v >= 10 ? Math.round(v) : v.toFixed(1)} min`, line: (v) => `Each prompt keeps your agent working for ${v}`, they: (v, w) => `Each of ${w}'s prompts keeps their agent working for ${v}` },
+  // workPerPrompt: Log. Anthropic: the median turn is about 45 s, but the 99.9th passed 45 min [A1], and experts get about 12 actions per prompt [A2]; a person's mean sits above the median turn.
+  { key: "workPerPrompt", name: "Agent work per prompt", scale: 100, prior: [0.5, 2, 8], log: true, good: 1, value: (m) => m.agentTurns && m.agentTurns >= 3 ? (m.agentBusyMinutes ?? 0) / m.agentTurns : null, fmt: (v) => `${v >= 10 ? Math.round(v) : v.toFixed(1)} min`, line: (v) => `Each prompt keeps your agent working for ${v}`, they: (v, w) => `Each of ${w}'s prompts keeps their agent working for ${v}` },
+  // utilization: Share. Unchanged: no new evidence.
   { key: "utilization", name: "Agents working, not waiting", scale: 1e3, prior: [0.25, 0.5, 0.8], good: 1, value: (m) => {
     const b = m.agentBusyMinutes ?? 0, w = m.agentWaitMinutes ?? 0;
     return m.agentTurns && m.agentTurns >= 3 && b + w > 0 ? b / (b + w) : null;
   }, fmt: pct, line: (v) => `Your agents spend ${v} of their time working rather than waiting for you`, they: (v, w) => `${w}'s agents spend ${v} of their time working rather than waiting` },
-  { key: "agentsAtOnce", name: "Agents working at once", scale: 100, prior: [0.3, 0.6, 1.4], value: (m) => m.wallMinutes && m.wallMinutes >= 30 && m.agentBusyMinutes ? m.agentBusyMinutes / m.wallMinutes : null, fmt: (v) => v.toFixed(1), line: (v) => `On average ${v} of your agents are working at any moment`, they: (v, w) => `On average ${v} of ${w}'s agents are working at any moment` },
+  // agentsAtOnce: Log. As concurrency and parallel.
+  { key: "agentsAtOnce", name: "Agents working at once", scale: 100, prior: [0.3, 0.7, 2], log: true, value: (m) => m.wallMinutes && m.wallMinutes >= 30 && m.agentBusyMinutes ? m.agentBusyMinutes / m.wallMinutes : null, fmt: (v) => v.toFixed(1), line: (v) => `On average ${v} of your agents are working at any moment`, they: (v, w) => `On average ${v} of ${w}'s agents are working at any moment` },
   // Wrapped only
+  // peakHour: Hour of the day, Wrapped only. Unchanged.
   { key: "peakHour", name: "Busiest hour", scale: 1, prior: [8, 14, 22], wrapped: true, fun: true, value: (m) => m.humanTurns >= 5 ? m.hourHistogram.indexOf(Math.max(...m.hourHistogram)) : null, fmt: (v) => hourLabel(v), line: (v) => `Your busiest hour is ${v}`, they: (v, w) => `${w}'s busiest hour is ${v}` },
+  // weekend: Share, Wrapped only. Unchanged.
   { key: "weekend", name: "Prompts on weekends", scale: 1e3, prior: [0, 0.12, 0.4], wrapped: true, fun: true, value: (m) => m.humanTurns >= 5 ? m.weekendShare : null, fmt: pct, line: (v) => `${v} of your prompts are sent on weekends`, they: (v, w) => `${v} of ${w}'s prompts are sent on weekends` },
   // Appended last: share links store values in this order, so new signals go at the end.
+  // outbursts: Rate per prompt, Wrapped only. Unchanged.
   { key: "outbursts", name: "Outbursts", scale: 1e3, prior: [0, 0.02, 0.12], wrapped: true, fun: true, value: (m) => per(m.profanity + (m.hostility ?? 0) + m.yelling, m.humanTurns, 5), fmt: (v) => n1(v * 10), line: (v) => `You lose your temper ${v} times per 10 prompts`, they: (v, w) => `${w} loses their temper ${v} times per 10 prompts` },
   // Outcomes (src/lib/analyzer/outcomes.ts). We have no population data for these yet, so every prior below is a wide
   // guess that the real distribution will replace as people share (see percentileFor). Where a prior leans on an
   // existing signal's prior, the comment says which.
   // Verified finish is stricter than "Checks after edits" (it needs a pass, by a real test or build tool, after the
-  // session's last edit, or a commit), so its cutoffs sit below that signal's [0.2, 0.55, 0.9].
+  // session's last edit, or a commit), so its cutoffs sit below that signal's [0.25, 0.6, 0.92].
+  // finish: Share. Unchanged: Anthropic's verified-success rates of 15-33% [A2] count a stricter outcome.
   { key: "finish", name: "Sessions that end verified", scale: 1e3, prior: [0.1, 0.45, 0.85], good: 1, value: (m) => per(m.verifiedFinishes ?? 0, m.codeEditSessions ?? 0, 2), fmt: pct, line: (v) => `${v} of your coding sessions end with passing checks or a commit after the last edit`, they: (v, w) => `${v} of ${w}'s coding sessions end with passing checks or a commit after the last edit` },
   // Wide guess: most sessions resolve what they break; a long tail leaves a few failures behind.
-  { key: "unresolved", name: "Errors left unresolved", scale: 100, prior: [0, 0.4, 2], good: -1, value: (m) => m.unresolvedErrors === void 0 || m.toolCalls < 10 ? null : per(m.unresolvedErrors, m.sessions, 2), fmt: n1, line: (v) => `Your sessions end with ${v} unresolved errors on average`, they: (v, w) => `${w}'s sessions end with ${v} unresolved errors on average` },
+  // unresolved: Log. Unchanged cutoffs, now read on a log scale.
+  { key: "unresolved", name: "Errors left unresolved", scale: 100, prior: [0, 0.4, 2], log: true, good: -1, value: (m) => m.unresolvedErrors === void 0 || m.toolCalls < 10 ? null : per(m.unresolvedErrors, m.sessions, 2), fmt: n1, line: (v) => `Your sessions end with ${v} unresolved errors on average`, they: (v, w) => `${w}'s sessions end with ${v} unresolved errors on average` },
   // Kept apart from "Errors left unresolved": loops are rare, so a combined number would be unknown for most people
   // or swamped by one part, and the two answer different questions (how work ends, and what you do when the agent
   // keeps failing). Wide guess, no data.
+  // loops: Share. Unchanged.
   { key: "loops", name: "Retry loops you step into", scale: 1e3, prior: [0, 0.4, 0.9], good: 1, value: (m) => per(m.loopsSteppedIn ?? 0, m.retryLoops ?? 0, 2), fmt: pct, line: (v) => `You step in during ${v} of the agent's retry loops`, they: (v, w) => `${w} steps in during ${v} of the agent's retry loops` },
   // Wide guess, no data: we expect about a third of corrections to follow a failure or a missed instruction.
+  // catches: Share. Unchanged.
   { key: "catches", name: "Corrections that catch mistakes", scale: 1e3, prior: [0.1, 0.35, 0.7], good: 1, value: (m) => m.catches === void 0 ? null : per(m.catches, m.corrections, 3), fmt: pct, line: (v) => `${v} of your corrections catch a mistake that the agent then fixes`, they: (v, w) => `${v} of ${w}'s corrections catch a mistake that the agent then fixes` },
   // Wide guess, no data: most people rarely edit these files, so the median is low.
-  { key: "lessons", name: "Saves lessons to CLAUDE.md or AGENTS.md", scale: 1e3, prior: [0, 0.04, 0.2], good: 1, value: (m) => m.configEditSessions === void 0 ? null : per(m.configEditSessions, m.sessions, 5), fmt: pct, line: (v) => `You update CLAUDE.md, AGENTS.md or memory files in ${v} of your sessions`, they: (v, w) => `${w} updates CLAUDE.md, AGENTS.md or memory files in ${v} of their sessions` },
+  // lessons: Share. Heavy Claude Code users keep CLAUDE.md and memory files up to date more often, and Claude Code now writes memory files itself.
+  { key: "lessons", name: "Saves lessons to CLAUDE.md or AGENTS.md", scale: 1e3, prior: [0, 0.06, 0.3], good: 1, value: (m) => m.configEditSessions === void 0 ? null : per(m.configEditSessions, m.sessions, 5), fmt: pct, line: (v) => `You update CLAUDE.md, AGENTS.md or memory files in ${v} of your sessions`, they: (v, w) => `${w} updates CLAUDE.md, AGENTS.md or memory files in ${v} of their sessions` },
   // Wide guess, no data.
+  // resets: Share. Unchanged.
   { key: "resets", name: "Clears or compacts long contexts", scale: 1e3, prior: [0, 0.35, 0.9], good: 1, value: (m) => per(m.contextResets ?? 0, (m.contextResets ?? 0) + (m.autoCompactions ?? 0), 2), fmt: pct, line: (v) => `You clear or compact the context yourself in ${v} of resets, before automatic compaction does it`, they: (v, w) => `${w} clears or compacts the context in ${v} of resets, before automatic compaction does it` },
   // Wide guess, no data: a few edits per check is typical when the agent tests as it goes.
-  { key: "batch", name: "Edits between checks", scale: 10, prior: [1.5, 4, 12], good: -1, value: (m) => per(m.batchEdits ?? 0, m.checkBatches ?? 0, 3), fmt: n1, line: (v) => `Your agent makes ${v} code edits before a test, build or lint checks them`, they: (v, w) => `${w}'s agent makes ${v} code edits before a test, build or lint checks them` },
-  // The "Tokens per line written" prior [800, 4000, 20000] times about 200 lines in a typical coding session, then
-  // widened because sessions that don't end verified add tokens but not outcomes. Stored in thousands (scale 0.001)
-  // so that share links stay within seven digits.
-  { key: "tokensFinish", name: "Tokens per verified session", scale: 1e-3, prior: [15e4, 1e6, 6e6], good: -1, value: (m) => per(m.tokens.input + m.tokens.cacheWrite + m.tokens.output + m.tokens.subagent, m.verifiedFinishes ?? 0, 2), fmt: big, line: (v) => `Your agents use ${v} tokens for each session that ends verified`, they: (v, w) => `${w}'s agents use ${v} tokens for each session that ends verified` },
+  // batch: Log. Unchanged cutoffs, now read on a log scale.
+  { key: "batch", name: "Edits between checks", scale: 10, prior: [1.5, 4, 12], log: true, good: -1, value: (m) => per(m.batchEdits ?? 0, m.checkBatches ?? 0, 3), fmt: n1, line: (v) => `Your agent makes ${v} code edits before a test, build or lint checks them`, they: (v, w) => `${w}'s agent makes ${v} code edits before a test, build or lint checks them` },
+  // Stored in thousands (scale 0.001) so that share links stay within seven digits.
+  // tokensFinish: Log. The new tokens-per-line cutoffs times about 200 lines per coding session, widened because sessions that don't end verified add tokens but not outcomes.
+  { key: "tokensFinish", name: "Tokens per verified session", scale: 1e-3, prior: [3e5, 25e5, 15e6], log: true, good: -1, value: (m) => per(m.tokens.input + m.tokens.cacheWrite + m.tokens.output + m.tokens.subagent, m.verifiedFinishes ?? 0, 2), fmt: big, line: (v) => `Your agents use ${v} tokens for each session that ends verified`, they: (v, w) => `${w}'s agents use ${v} tokens for each session that ends verified` },
   // Wrapped totals (fun only; never compared or ranked). Totals depend on how much someone uploads, so each value is
   // capped to fit seven digits at its scale. Tokens are stored in units of 10,000 and dollars in units of 10 cents.
-  { key: "tokensAll", name: "Tokens used", scale: 1e-4, prior: [5e6, 15e7, 3e9], wrapped: true, fun: true, value: (m) => {
+  // tokensAll: Log. Anthropic: about $13 per developer per active day and $150-250 a month, 90% under $30 a day [D1]; mostly cache reads, that is tens of millions of tokens a day, and heavy Max users run billions a month.
+  { key: "tokensAll", name: "Tokens used", scale: 1e-4, prior: [3e7, 6e8, 6e9], log: true, wrapped: true, fun: true, value: (m) => {
     const t = allTokens(m);
     return t > 0 ? fit(t, 1e-4) : null;
   }, fmt: tokenCount, line: (v) => `Your agents used ${v} tokens`, they: (v, w) => `${w}'s agents used ${v} tokens` },
-  { key: "cacheShare", name: "Input read from the cache", scale: 1e3, prior: [0.6, 0.9, 0.97], wrapped: true, fun: true, value: cacheShare, fmt: pct, line: (v) => `${v} of your agents' input tokens were read from the cache`, they: (v, w) => `${v} of ${w}'s agents' input tokens were read from the cache` },
-  { key: "apiCost", name: "Cost at API list prices", scale: 10, prior: [5, 150, 3e3], wrapped: true, fun: true, value: (m) => {
+  // cacheShare: Share. Claude Code's own /usage example shows 91% of input from the cache [D1]; long sessions sit higher.
+  { key: "cacheShare", name: "Input read from the cache", scale: 1e3, prior: [0.75, 0.92, 0.98], wrapped: true, fun: true, value: cacheShare, fmt: pct, line: (v) => `${v} of your agents' input tokens were read from the cache`, they: (v, w) => `${v} of ${w}'s agents' input tokens were read from the cache` },
+  // apiCost: Log. $150-250 per developer per month on average in enterprises [D1]; people who upload are heavier, often on Max plans whose list-price value runs to thousands.
+  { key: "apiCost", name: "Cost at API list prices", scale: 10, prior: [20, 400, 4e3], log: true, wrapped: true, fun: true, value: (m) => {
     const c = costOf(m);
     return c && c.usd > 0 ? fit(c.usd, 10) : null;
   }, fmt: usd, line: (v) => `Your tokens would cost ${v} at API list prices`, they: (v, w) => `${w}'s tokens would cost ${v} at API list prices` },
   // an index into MODEL_FAMILIES (src/lib/analyzer/prices.ts), which is append-only so that old links keep their model
+  // mainModel: An index into MODEL_FAMILIES, never compared. Unchanged.
   { key: "mainModel", name: "Main model by cost", scale: 1, prior: [0, 7, 20], wrapped: true, fun: true, value: (m) => costOf(m)?.families[0]?.family ?? null, fmt: modelName, line: (v) => `Most of your API cost is ${v}`, they: (v, w) => `Most of ${w}'s API cost is ${v}` },
+  // mainModelShare: Share. Unchanged.
   { key: "mainModelShare", name: "Main model's share of the cost", scale: 1e3, prior: [0.5, 0.8, 0.98], wrapped: true, fun: true, value: (m) => {
     const c = costOf(m);
     return c && c.usd > 0 ? c.families[0].usd / c.usd : null;
   }, fmt: pct, line: (v) => `Your main model accounts for ${v} of your API cost`, they: (v, w) => `${w}'s main model accounts for ${v} of their API cost` },
-  { key: "unpricedTokens", name: "Tokens without a known price", scale: 1e-4, prior: [0, 0, 1e7], wrapped: true, fun: true, value: (m) => {
+  // unpricedTokens: Log. Unchanged: almost everyone is at 0.
+  { key: "unpricedTokens", name: "Tokens without a known price", scale: 1e-4, prior: [0, 0, 1e7], log: true, wrapped: true, fun: true, value: (m) => {
     const c = costOf(m);
     return c ? fit(c.unpricedTokens, 1e-4) : null;
   }, fmt: tokenCount, line: (v) => `${v} of your tokens came from models without a known price`, they: (v, w) => `${v} of ${w}'s tokens came from models without a known price` },
-  { key: "promptsAll", name: "Prompts sent", scale: 1, prior: [40, 400, 3e3], wrapped: true, fun: true, value: (m) => m.humanTurns > 0 ? fit(m.humanTurns, 1) : null, fmt: (v) => Math.round(v).toLocaleString("en-US"), line: (v) => `You sent ${v} prompts`, they: (v, w) => `${w} sent ${v} prompts` },
-  { key: "linesAll", name: "Lines written by agents", scale: 1, prior: [500, 8e3, 8e4], wrapped: true, fun: true, value: (m) => m.linesWritten > 0 ? fit(m.linesWritten, 1) : null, fmt: (v) => Math.round(v).toLocaleString("en-US"), line: (v) => `Your agents wrote ${v} lines`, they: (v, w) => `${w}'s agents wrote ${v} lines` },
-  { key: "busiestDay", name: "Most prompts in one day", scale: 1, prior: [10, 40, 120], wrapped: true, fun: true, value: (m) => m.busiestDayPrompts ? fit(m.busiestDayPrompts, 1) : null, fmt: (v) => String(Math.round(v)), line: (v) => `You sent ${v} prompts on your busiest day`, they: (v, w) => `${w} sent ${v} prompts on their busiest day` },
-  { key: "longestSession", name: "Longest session", scale: 1, prior: [30, 120, 400], wrapped: true, fun: true, value: (m) => m.longestSessionMinutes > 0 ? fit(m.longestSessionMinutes, 1) : null, fmt: duration, line: (v) => `Your longest session had ${v} of active work`, they: (v, w) => `${w}'s longest session had ${v} of active work` }
+  // promptsAll: Log. A month of heavy use (about 20 hours a week [A2]).
+  { key: "promptsAll", name: "Prompts sent", scale: 1, prior: [60, 600, 4e3], log: true, wrapped: true, fun: true, value: (m) => m.humanTurns > 0 ? fit(m.humanTurns, 1) : null, fmt: (v) => Math.round(v).toLocaleString("en-US"), line: (v) => `You sent ${v} prompts`, they: (v, w) => `${w} sent ${v} prompts` },
+  // linesAll: Log. A month of heavy use, as pace.
+  { key: "linesAll", name: "Lines written by agents", scale: 1, prior: [1e3, 15e3, 15e4], log: true, wrapped: true, fun: true, value: (m) => m.linesWritten > 0 ? fit(m.linesWritten, 1) : null, fmt: (v) => Math.round(v).toLocaleString("en-US"), line: (v) => `Your agents wrote ${v} lines`, they: (v, w) => `${w}'s agents wrote ${v} lines` },
+  // busiestDay: Log. As promptsAll.
+  { key: "busiestDay", name: "Most prompts in one day", scale: 1, prior: [15, 60, 200], log: true, wrapped: true, fun: true, value: (m) => m.busiestDayPrompts ? fit(m.busiestDayPrompts, 1) : null, fmt: (v) => String(Math.round(v)), line: (v) => `You sent ${v} prompts on your busiest day`, they: (v, w) => `${w} sent ${v} prompts on their busiest day` },
+  // longestSession: Log. Active minutes; above the per-session cutoffs, since it is each person's maximum.
+  { key: "longestSession", name: "Longest session", scale: 1, prior: [30, 180, 600], log: true, wrapped: true, fun: true, value: (m) => m.longestSessionMinutes > 0 ? fit(m.longestSessionMinutes, 1) : null, fmt: duration, line: (v) => `Your longest session had ${v} of active work`, they: (v, w) => `${w}'s longest session had ${v} of active work` },
+  // Appended last (share links). wait: Log. Median minutes from the end of an agent run to your next message, breaks of
+  // 10 minutes or more left out (src/lib/analyzer/runs.ts). Reading the agent's summary and typing a 45-word prompt
+  // takes one to two minutes; one-word approvals take seconds, and people juggling parallel sessions leave each agent
+  // waiting several minutes. Needs 5 waits.
+  { key: "wait", name: "Agent waits for you", scale: 100, prior: [0.3, 1.5, 5], log: true, good: -1, value: (m) => m.agentWaits && m.agentWaits >= 5 && m.agentWaitMedianMinutes !== void 0 ? m.agentWaitMedianMinutes : null, fmt: (v) => v < 1 ? `${Math.round(v * 60)} s` : `${n1(v)} min`, line: (v) => `Your agent waits ${v} for you between runs`, they: (v, w) => `${w}'s agent waits ${v} for them between runs` },
+  // How people brief the agent, and work it redoes (src/lib/analyzer/specificity.ts, churn.ts; docs/RESEARCH.md).
+  // Descriptive first: we don't yet know which level of detail leads to good outcomes, and expect an inverted U
+  // (too vague and too prescriptive both cost time), so vague follow-ups have no better direction until the research
+  // in docs/RESEARCH.md says otherwise. Only avoidable rework is judged: redoing work after a correction is wasted
+  // time whatever caused it. Both priors are wide guesses with no population data; the first look at real
+  // transcripts is in docs/RESEARCH.md. How prescriptive prompts are is measured (prescriptivePrompts) but not yet a
+  // signal: see docs/RESEARCH.md, "Signals".
+  // Share links: append only (src/lib/links.ts). Signals no longer need adding in pairs: the decoder tells a single
+  // person at an even token count from two people of an older width by their handles (docs/CALIBRATION.md, "Adding a
+  // signal").
+  // vague: Log, per 10 prompts. "fix this", "make it work", "still broken" with nothing they could refer to. Rare in long briefs, common in quick back-and-forth.
+  { key: "vague", name: "Vague follow-ups per 10 prompts", scale: 10, prior: [0, 0.4, 1.5], log: true, value: (m) => m.vaguePrompts === void 0 || m.humanTurns < 5 ? null : m.vaguePrompts / m.humanTurns * 10, fmt: n1, line: (v) => `You send ${v} vague follow-ups ("fix this", "still broken") per 10 prompts`, they: (v, w) => `${w} sends ${v} vague follow-ups ("fix this", "still broken") per 10 prompts` },
+  // rework: Share of coding turns that redo earlier work after a correction, an undo or a repeated ask, without a stated change of plan. Sits below Corrections [0.02, 0.08, 0.2]: only corrections that lead to redone code count.
+  { key: "rework", name: "Avoidable rework", scale: 1e3, prior: [0, 0.06, 0.2], good: -1, value: (m) => m.workTurns === void 0 ? null : per(m.avoidableRedos ?? 0, m.workTurns, 5), fmt: pct, line: (v) => `${v} of your agent's coding turns redo earlier work after a correction, an undo or a repeated ask`, they: (v, w) => `${v} of ${w}'s agent's coding turns redo earlier work after a correction, an undo or a repeated ask` }
 ];
 var SIGNAL_BY_KEY = Object.fromEntries(SIGNALS.map((s) => [s.key, s]));
 function signalValues(m) {
@@ -1388,11 +1795,18 @@ function exactPercentileOf(q, v) {
   const span = q[i + 1] - q[i];
   return 0.5 + 99 * (i + (span > 0 ? (v - q[i]) / span : 0.5)) / last;
 }
-function priorPercentile([p10, p50, p90], v) {
-  if (v <= p10) return p10 > 0 ? 10 ** (v / p10) : 5;
-  if (v <= p50) return 10 + 40 * (v - p10) / (p50 - p10);
-  if (v <= p90) return 50 + 40 * (v - p50) / (p90 - p50);
-  return 100 - 10 ** (1 - (v - p90) / Math.max(1e-9, p90 - p50));
+var priorAxis = (v, log) => log && v >= 0 ? Math.log1p(v) : v;
+var priorTail = (u) => 1 / (1 + u) ** 2;
+function priorPercentile(prior, v, log = false) {
+  const [x10, x50, x90] = prior.map((p) => priorAxis(p, log));
+  const x = priorAxis(v, log);
+  const at10 = prior[0] > 0 ? 10 : 5;
+  const lowUnit = Math.max(1e-9, x50 - x10);
+  const highUnit = Math.max(1e-9, x90 - x50);
+  if (x <= x10) return at10 * priorTail((x10 - x) / lowUnit);
+  if (x <= x50) return at10 + (50 - at10) * (x - x10) / lowUnit;
+  if (x <= x90) return 50 + 40 * (x - x50) / highUnit;
+  return 100 - 10 * priorTail((x - x90) / highUnit);
 }
 function dataWeight(key, ref) {
   const n = ref?.n[key] ?? 0;
@@ -1400,7 +1814,7 @@ function dataWeight(key, ref) {
 }
 function exactPercentile(key, v, ref) {
   const s = SIGNAL_BY_KEY[key];
-  const prior = priorPercentile(s.prior, v);
+  const prior = priorPercentile(s.prior, v, s.log);
   const w = dataWeight(key, ref);
   return w ? w * exactPercentileOf(ref.quantiles[key], v) + (1 - w) * prior : prior;
 }
@@ -1425,7 +1839,11 @@ function profileLines(values, ref, who) {
     const v = values[s.key];
     const p = percentilePrecise(s.key, v, ref);
     return { key: s.key, text: who ? s.they(s.fmt(v), who) : s.line(s.fmt(v)), compare: compareWords(p), pct: p, value: v };
-  }).sort((a, b) => Math.abs(b.pct - 50) - Math.abs(a.pct - 50));
+  }).sort((a, b) => standout(b) - standout(a));
+}
+function standout(l) {
+  const d = Math.abs(l.pct - 50);
+  return l.value <= 0 && SIGNAL_BY_KEY[l.key].prior[0] <= 0 ? d / 2 : d;
 }
 function signatureOf(values, ref, who) {
   const out = [];
@@ -1481,6 +1899,11 @@ var COACH = {
     improve: (v) => `Your agents spend ${v} of their time working; the rest they sit waiting for your next prompt. With several sessions open, that waiting is where the time goes.`,
     tip: { title: "Keep fewer sessions busier", body: "Running more windows only helps if each agent has enough to do. Give each one a substantial task, or close the ones that keep waiting for you." }
   },
+  wait: {
+    keep: (v) => `Your agent waits ${v} for you between runs, so it spends little of the session idle.`,
+    improve: (v) => `Your agent waits ${v} for you between runs. That's time the session sits idle while you read its output and write the next message.`,
+    tip: { title: "Queue the next step", body: "Send the next instruction while the agent is still working: it picks the message up at its next step without stopping. Ask for a short summary at the end of each run, so that it's quick to read." }
+  },
   finish: {
     keep: (v) => `${v} of your coding sessions end with passing checks or a commit after the last edit, so you know that the work runs when you stop.`,
     improve: (v) => `${v} of your coding sessions end with passing checks or a commit after the last edit. In the rest, nothing confirmed that the last change works.`,
@@ -1520,6 +1943,11 @@ var COACH = {
     keep: (v) => `Your agents use ${v} tokens for each session that ends verified, which is fewer than most people use.`,
     improve: (v) => `Your agents use ${v} tokens for each session that ends verified. Tokens spent in sessions that never reach a passing check or a commit count against this number.`,
     tip: { title: "Spend tokens on finished work", body: "Give the agent a test or command that proves the task is done, and start a fresh session for each task, so that fewer tokens go to work that's never confirmed." }
+  },
+  rework: {
+    keep: (v) => `${v} of your agent's coding turns redo earlier work after you push back, so most of what it builds stays built.`,
+    improve: (v) => `${v} of your agent's coding turns redo earlier work after a correction, an undo or a repeated ask. Each redo spends time and tokens on something the first attempt missed.`,
+    tip: { title: "Say what and how you'll know", body: 'Before the agent starts, name the thing to change and what done looks like (a test, an example, the expected output). When it misses, say what is wrong and where, rather than "still broken".' }
   },
   corrections: {
     keep: (v) => `You correct the agent on ${v} of prompts, so your first request usually works.`,
@@ -2054,9 +2482,9 @@ var consentFields = (allowImprovement) => ({ confirmRights: true, allowImproveme
 var FILLER = new Set(
   "a an and or but the this that these those it its it's is are was were be been being am do does did done doing to of in on at by for with from as into onto up down out over so then than too very just also still even only now again already please pls plz thanks thank thx ty i me my we us our you your yours he she her him his they them their what which who how when where why there here yes yeah yep yup ya y ok okay k kk sure fine good great nice cool perfect alright right correct exactly agreed agree approve approved lgtm sgtm ack go ahead proceed continue continuing keep going carry on next more sounds looks seems can could would should will shall may might must let lets let's want need like try trying get got make made solve solved solving solution implement implemented implementation build finish finished complete completed work working do it everything all whole entire full rest remaining anything something stuff thing things challenge task problem ticket job spec code coding test tests testing tested pass passing passes fail failing failed fix fixed bug bugs error errors run running rerun submit submitted submission until till start started begin go on yourself own alone autonomously automatically best whatever think see know claude agent ai model no nope not don't dont stop wait hold".split(/\s+/)
 );
-var wordsOf = (s) => (s.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'._%-]*/gu) ?? []).map((w) => w.replace(/[.'_%-]+$/, ""));
-function contentWords(text) {
-  return wordsOf(text).filter((w) => w.length > 1 && !FILLER.has(w));
+var wordsOf2 = (s) => (s.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'._%-]*/gu) ?? []).map((w) => w.replace(/[.'_%-]+$/, ""));
+function contentWords2(text) {
+  return wordsOf2(text).filter((w) => w.length > 1 && !FILLER.has(w));
 }
 var ASK_CMD = /\bvibrometer(?:\.mjs)?["']?\s+ask\s+([\s\S]+)$/i;
 function askQuestion(command) {
@@ -2470,7 +2898,7 @@ function askContext(active) {
       } else if (e.kind === "tool" && askQuestion(e.detail)) asks++;
     }
     if (!lastPrompt) return { ...none, afterHumanPrompt: false };
-    return { afterHumanPrompt: asks <= 1, msSincePrompt: Math.max(0, Date.now() - lastPrompt.t), asksSincePrompt: asks, promptWords: contentWords(lastPrompt.text).length };
+    return { afterHumanPrompt: asks <= 1, msSincePrompt: Math.max(0, Date.now() - lastPrompt.t), asksSincePrompt: asks, promptWords: contentWords2(lastPrompt.text).length };
   } catch {
     return none;
   }
