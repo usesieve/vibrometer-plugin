@@ -7,6 +7,14 @@ allowed-tools: Bash(node:*)
 
 The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUGIN_ROOT` is empty, it's at `../../scripts/vibrometer.mjs` relative to this file). Nothing is uploaded unless the command includes `--yes`, and conversations are uploaded only when it also includes `--confirm-rights`. Follow these steps in order. Never add `--yes` before the user has confirmed the selection, never add `--confirm-rights` unless the user has said yes to the first statement in step 4, and never add `--allow-improvement` unless the user has said yes to the second statement.
 
+0. **Make sure the user is signed in.** Uploading needs a Vibrometer account.
+
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" status
+   ```
+
+   If it shows `"signedIn": false`, sign in first by following the steps of `/vibrometer:login`: run `login --no-wait`, show the user the link and code it prints and ask them to approve it in their browser, then run `login --wait` with the Bash timeout set to 600000 ms. Never approve it for them. If they'd rather not sign in, you can still do steps 1 to 3, which only preview their vibe check on this computer; nothing can be uploaded.
+
 1. **List the conversations.**
 
    ```bash
@@ -50,4 +58,4 @@ The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUG
 
    If the command stops with "Nothing was uploaded", show the user its message and go back to step 4.
 
-Then show the result link exactly as printed. Mention that they can share the link with friends to compare and start a group on the site. Uploaded conversations that the server verifies count toward the Pantheon's habit boards (a `--private` upload doesn't). The skill rankings come from the timed challenges: `/vibrometer:challenge <slug>`.
+Then show the result link exactly as printed (the site's `#you` page), and tell the user to sign in there with the same account they approved this computer with: the vibe check is kept on that account, so it shows on any device. If the output says the vibe check isn't on the boards, pass on its reason. Mention that they can share the link with friends to compare and start a group on the site. Uploaded conversations that the server verifies count toward the Pantheon's habit boards (a `--private` upload doesn't). The skill rankings come from the timed challenges, which measure how the user directs an agent: `/vibrometer:challenge <slug>` shows a challenge's ticket, and `/vibrometer:start` starts its clock.

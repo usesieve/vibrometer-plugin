@@ -1,10 +1,12 @@
 ---
 name: submit
-description: Submit the active Vibrometer challenge solution for grading against hidden tests, and post to the leaderboard. Use when the user wants to submit their vibrometer challenge.
+description: Submit the active Vibrometer challenge solution for grading against hidden tests, and post to the leaderboard. Use only when the user asks to submit their vibrometer challenge.
 allowed-tools: Bash(node:*)
 ---
 
-Submitting uploads the solution file and this session's transcript, which is compacted and redacted first. The transcript is a conversation, so the upload needs the user's confirmation first.
+Submit only when the user asks: when to submit is their call. Submitting uploads the solution file and this session's transcript, which is compacted and redacted first. The transcript is a conversation, so the upload needs the user's confirmation first.
+
+The transcript also shows how the user directed the work. A session with fewer than 3 prompts from the user that direct the work (replies like "go", "continue", "yes" or "solve it" don't count), or in which you asked the stakeholder questions on your own, is graded but kept off the leaderboards as practice. If that's likely, say so to the user before submitting.
 
 1. **Ask about the two statements.** Show the user both statements word for word, exactly as below. Don't paraphrase or shorten them.
 
@@ -29,6 +31,8 @@ Submitting uploads the solution file and this session's transcript, which is com
 
    If the command stops with "Nothing was uploaded", show the user its message and go back to step 1.
 
-Report the result to the user: pass/fail, hidden-test count, time, turns, tokens, verification status and leaderboard ranks.
+If the command says the enrollment belongs to another account, the plugin is signed in to a different account from the one that enrolled. Tell the user; `/vibrometer:login` signs in again.
 
-If hidden tests failed, the output lists the failing test names. Ask the user whether to fix and resubmit; the clock keeps running. Each resubmission is a new upload, so ask about both statements again before it.
+Report the result to the user: pass/fail, hidden-test count, how it compares with the AI-alone score, time, prompts, tokens, verification status and leaderboard ranks. If the output says the attempt is practice and not ranked, show the user the reason exactly as printed.
+
+If hidden tests failed, the output lists the failing test names. Ask the user what they want to do; the clock keeps running. Don't start fixing until they direct it. Each resubmission is a new upload, so ask about both statements again before it.

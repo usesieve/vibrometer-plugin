@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // Vibrometer CLI (generated: edit src/cli/vibrometer.ts and run npm run build:cli)
 
+// <define:__CHALLENGES__>
+var define_CHALLENGES_default = [{ slug: "bank-reconciliation", title: "Month-End Bank Reconciliation", difficulty: "hard" }, { slug: "claims-underpayment", title: "Payer Underpayment Audit", difficulty: "hard" }, { slug: "crew-legality", title: "Part 117 Crew Legality Audit", difficulty: "hard" }, { slug: "tou-solar-bill", title: "Solar Billing Disputes", difficulty: "hard" }];
+
 // src/cli/vibrometer.ts
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
@@ -1368,41 +1372,58 @@ function signalValues(m) {
     return [s.key, v === null || !Number.isFinite(v) ? null : v];
   }));
 }
-function percentileOf(q, v) {
+function exactPercentileOf(q, v) {
   if (!q?.length) return 50;
-  if (v <= q[0]) return 0;
-  if (v >= q[q.length - 1]) return 100;
+  const last = q.length - 1;
+  let lo = 0;
+  while (lo < last && q[lo + 1] === q[lo]) lo++;
+  let hi = last;
+  while (hi > 0 && q[hi - 1] === q[hi]) hi--;
+  const gapLo = lo < last ? q[lo + 1] - q[lo] : 0;
+  const gapHi = hi > 0 ? q[hi] - q[hi - 1] : 0;
+  if (v <= q[0]) return gapLo > 0 ? 0.5 * Math.exp(-(q[0] - v) / gapLo) : 0.5;
+  if (v >= q[last]) return gapHi > 0 ? 100 - 0.5 * Math.exp(-(v - q[last]) / gapHi) : 99.5;
   let i = 0;
-  while (i < q.length - 1 && q[i + 1] <= v) i++;
+  while (i < last && q[i + 1] <= v) i++;
   const span = q[i + 1] - q[i];
-  return Math.round((i + (span > 0 ? (v - q[i]) / span : 0.5)) / (q.length - 1) * 100);
+  return 0.5 + 99 * (i + (span > 0 ? (v - q[i]) / span : 0.5)) / last;
 }
 function priorPercentile([p10, p50, p90], v) {
-  if (v <= p10) return p10 > 0 ? Math.max(1, 10 * v / p10) : 5;
+  if (v <= p10) return p10 > 0 ? 10 ** (v / p10) : 5;
   if (v <= p50) return 10 + 40 * (v - p10) / (p50 - p10);
   if (v <= p90) return 50 + 40 * (v - p50) / (p90 - p50);
-  return Math.min(99, 90 + 9 * (v - p90) / Math.max(1e-9, p90 - p50));
+  return 100 - 10 ** (1 - (v - p90) / Math.max(1e-9, p90 - p50));
 }
 function dataWeight(key, ref) {
   const n = ref?.n[key] ?? 0;
   return n >= MIN_CALIBRATION_N && ref?.quantiles[key] ? n / (n + PRIOR_STRENGTH) : 0;
 }
-function percentileFor(key, v, ref) {
+function exactPercentile(key, v, ref) {
   const s = SIGNAL_BY_KEY[key];
   const prior = priorPercentile(s.prior, v);
   const w = dataWeight(key, ref);
-  return Math.round(w ? w * percentileOf(ref.quantiles[key], v) + (1 - w) * prior : prior);
+  return w ? w * exactPercentileOf(ref.quantiles[key], v) + (1 - w) * prior : prior;
+}
+function percentileFor(key, v, ref) {
+  return Math.round(exactPercentile(key, v, ref));
+}
+var PCT_MIN = 0.01;
+var PCT_MAX = 99.99;
+var clampPct = (p) => Math.min(PCT_MAX, Math.max(PCT_MIN, Math.round(p * 100) / 100));
+function percentilePrecise(key, v, ref) {
+  return clampPct(exactPercentile(key, v, ref));
+}
+function pctText(p) {
+  return `${clampPct(p).toFixed(2)}%`;
 }
 function compareWords(pct2) {
-  if (pct2 >= 95) return "Higher than 19 in 20 people";
-  if (pct2 <= 5) return "Lower than 19 in 20 people";
-  if (pct2 >= 50) return `Higher than ${Math.floor(pct2 / 10)} in 10 people`;
-  return `Lower than ${Math.max(5, Math.floor((100 - pct2) / 10))} in 10 people`;
+  const p = clampPct(pct2);
+  return p >= 50 ? `Higher than ${pctText(p)} of people` : `Lower than ${pctText(100 - p)} of people`;
 }
 function profileLines(values, ref, who) {
   return SIGNALS.filter((s) => !s.wrapped && values[s.key] !== null && values[s.key] !== void 0).map((s) => {
     const v = values[s.key];
-    const p = percentileFor(s.key, v, ref);
+    const p = percentilePrecise(s.key, v, ref);
     return { key: s.key, text: who ? s.they(s.fmt(v), who) : s.line(s.fmt(v)), compare: compareWords(p), pct: p, value: v };
   }).sort((a, b) => Math.abs(b.pct - 50) - Math.abs(a.pct - 50));
 }
@@ -1511,13 +1532,13 @@ function coachingFor(values, ref) {
   const judged = SIGNALS.filter((s) => s.good && values[s.key] !== null && values[s.key] !== void 0).map((s) => {
     const v = values[s.key];
     const p = percentileFor(s.key, v, ref);
-    return { s, v, p, goodness: s.good === 1 ? p : 100 - p };
+    return { s, v, p, exact: percentilePrecise(s.key, v, ref), goodness: s.good === 1 ? p : 100 - p };
   }).sort((a, b) => b.goodness - a.goodness);
   const out = [];
   for (const x of judged.filter((x2) => x2.goodness >= 60).slice(0, 2))
-    out.push({ kind: "strength", key: x.s.key, title: x.s.name, body: COACH[x.s.key].keep(x.s.fmt(x.v)), compare: compareWords(x.p) });
+    out.push({ kind: "strength", key: x.s.key, title: x.s.name, body: COACH[x.s.key].keep(x.s.fmt(x.v)), compare: compareWords(x.exact) });
   const weak = judged.filter((x) => x.goodness <= 40).reverse().slice(0, 2);
-  for (const x of weak) out.push({ kind: "blindspot", key: x.s.key, title: x.s.name, body: COACH[x.s.key].improve(x.s.fmt(x.v)), compare: compareWords(x.p) });
+  for (const x of weak) out.push({ kind: "blindspot", key: x.s.key, title: x.s.name, body: COACH[x.s.key].improve(x.s.fmt(x.v)), compare: compareWords(x.exact) });
   const focus = weak[0] ?? judged[judged.length - 1];
   if (focus) out.push({ kind: "tip", key: focus.s.key, ...COACH[focus.s.key].tip });
   return out;
@@ -1903,6 +1924,18 @@ function buildFunStats(m) {
   if (m.subagents > 0) stats.push({ label: "Subagents spawned", value: String(m.subagents) });
   return stats;
 }
+var MIN_RANKED_PROMPTS = 8;
+var MIN_RANKED_EDITS = 2;
+var tooShort = (m) => m.humanTurns < MIN_RANKED_PROMPTS || m.editTurns < MIN_RANKED_EDITS;
+function provisionalMessage(r) {
+  if (!r) return "Your vibe check isn't on the boards.";
+  if (r.kind === "sample") return "Your vibe check isn't on the boards because it was made from an example conversation.";
+  if (r.kind === "private") return "Your vibe check isn't on the boards because its numbers were computed on your device. Upload the conversations to be ranked.";
+  if (r.kind === "rejected") return `Your vibe check isn't on the boards because too many of the conversations didn't pass the checks (${r.rejected} of ${r.uploaded}).`;
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const have = [r.prompts < MIN_RANKED_PROMPTS ? plural(r.prompts, "prompt") : null, r.edits < MIN_RANKED_EDITS ? plural(r.edits, "edit") : null].filter(Boolean).join(" and ");
+  return `We need at least ${MIN_RANKED_PROMPTS} prompts and ${MIN_RANKED_EDITS} edits across your conversations; these have ${have}. Add more conversations.`;
+}
 function analyzeMetrics(m, calibration, opts = {}) {
   const cal = calibrationFor(m, calibration);
   const axes = computeAxes(m, cal);
@@ -1913,7 +1946,7 @@ function analyzeMetrics(m, calibration, opts = {}) {
     code: axesCode(axes, opts.previousCode),
     skills,
     vibeScore: vibeScore(skills),
-    provisional: m.humanTurns < 8 || m.editTurns < 2,
+    provisional: tooShort(m),
     insights: coachingFor(signalValues(m), cal?.signals),
     funStats: buildFunStats(m)
   };
@@ -1931,7 +1964,12 @@ var SECRET_PATTERNS = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]"],
   [/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, "[REDACTED_JWT]"],
   [/\b(postgres(ql)?|mysql|mongodb(\+srv)?|redis|amqp):\/\/[^\s'"]+/g, "[REDACTED_DB_URL]"],
-  [/((?:api[_-]?key|secret|token|password|passwd|pwd|auth)["']?\s*[:=]\s*["']?)[^\s"',;]{8,}/gi, "$1[REDACTED]"],
+  // Stripe-style secret and restricted keys (sk_live_..., rk_test_...)
+  [/\b[sr]k_(live|test)_[A-Za-z0-9]{16,}/g, "[REDACTED_STRIPE_KEY]"],
+  // Authorization: Bearer <token>, as in curl -H (a token has a digit; "Bearer authentication" stays)
+  [/\b(Bearer\s+)(?=[A-Za-z0-9._~+/-]*\d)[A-Za-z0-9._~+/-]{16,}=*/g, "$1[REDACTED]"],
+  // name = value: also names that continue after "secret" (secret_access_key, SECRET_KEY_BASE) and *_key names
+  [/((?:api[_-]?key|secret[A-Za-z0-9_-]{0,20}|(?:access|private|client)[_-]?key|token|password|passwd|pwd|auth)["']?\s*[:=]\s*["']?)[^\s"',;]{8,}/gi, "$1[REDACTED]"],
   [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[REDACTED_EMAIL]"]
 ];
 function redactSecrets(s) {
@@ -1939,10 +1977,11 @@ function redactSecrets(s) {
   for (const [re, rep] of SECRET_PATTERNS) out = out.replace(re, rep);
   return out;
 }
-function truncate(s, max) {
-  if (s.length <= max) return s;
+var REDACT_PAST_CUT = 4096;
+function clip(s, max) {
+  if (s.length <= max) return redactSecrets(s);
   const lines = s.split("\n").length;
-  return s.slice(0, max) + `\u2026\u27EAtrunc ${s.length}c ${lines}l\u27EB`;
+  return redactSecrets(s.slice(0, max + REDACT_PAST_CUT)).slice(0, max) + `\u2026\u27EAtrunc ${s.length}c ${lines}l\u27EB`;
 }
 var DROP_TYPES = /* @__PURE__ */ new Set(["attachment", "file-history-snapshot", "queue-operation", "atis-latch", "last-prompt", "tools-used", "summary"]);
 var KEEP_EDIT_FIELDS = /* @__PURE__ */ new Set(["content", "new_string", "old_string", "new_source", "input", "arguments", "command", "cmd"]);
@@ -1950,7 +1989,7 @@ function walk(v, key, opts, inToolResult) {
   if (typeof v === "string") {
     const editField = KEEP_EDIT_FIELDS.has(key);
     const max = inToolResult ? opts.mode === "challenge" ? 4e3 : 240 : editField ? opts.mode === "challenge" ? 4e4 : key === "command" || key === "cmd" ? 1e3 : 400 : key === "text" || key === "message" ? 4e3 : 1e3;
-    return redactSecrets(truncate(v, max));
+    return clip(v, max);
   }
   if (Array.isArray(v)) return v.map((x) => walk(x, key, opts, inToolResult));
   if (v && typeof v === "object") {
@@ -2011,6 +2050,22 @@ var IMPROVEMENT_NOTE = "Optional. It applies only to this upload, and you can wi
 var RIGHTS_REQUIRED_ERROR = `Confirm this statement before uploading: "${RIGHTS_STATEMENT}" Send confirmRights: true with the upload (in the CLI, add --confirm-rights).`;
 var consentFields = (allowImprovement) => ({ confirmRights: true, allowImprovement, consentVersion: CONSENT_VERSION });
 
+// src/lib/server/direction.ts
+var FILLER = new Set(
+  "a an and or but the this that these those it its it's is are was were be been being am do does did done doing to of in on at by for with from as into onto up down out over so then than too very just also still even only now again already please pls plz thanks thank thx ty i me my we us our you your yours he she her him his they them their what which who how when where why there here yes yeah yep yup ya y ok okay k kk sure fine good great nice cool perfect alright right correct exactly agreed agree approve approved lgtm sgtm ack go ahead proceed continue continuing keep going carry on next more sounds looks seems can could would should will shall may might must let lets let's want need like try trying get got make made solve solved solving solution implement implemented implementation build finish finished complete completed work working do it everything all whole entire full rest remaining anything something stuff thing things challenge task problem ticket job spec code coding test tests testing tested pass passing passes fail failing failed fix fixed bug bugs error errors run running rerun submit submitted submission until till start started begin go on yourself own alone autonomously automatically best whatever think see know claude agent ai model no nope not don't dont stop wait hold".split(/\s+/)
+);
+var wordsOf = (s) => (s.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'._%-]*/gu) ?? []).map((w) => w.replace(/[.'_%-]+$/, ""));
+function contentWords(text) {
+  return wordsOf(text).filter((w) => w.length > 1 && !FILLER.has(w));
+}
+var ASK_CMD = /\bvibrometer(?:\.mjs)?["']?\s+ask\s+([\s\S]+)$/i;
+function askQuestion(command) {
+  const m = command.match(ASK_CMD);
+  if (!m) return null;
+  const q = m[1].trim().replace(/^["'`]|["'`]$/g, "").trim();
+  return q && !q.startsWith("--") ? q : null;
+}
+
 // src/cli/vibrometer.ts
 var PRIVACY = `Before you upload, leave out any conversation that contains personal, sensitive or confidential
 information: customer or patient data, credentials, financial or health details, or code and documents
@@ -2040,6 +2095,7 @@ If the statement is true, run ${retry} again with --confirm-rights added.`);
 var CFG_DIR = process.env.VIBROMETER_HOME || join(homedir(), ".vibrometer");
 var CFG = join(CFG_DIR, "config.json");
 var ACTIVE = join(CFG_DIR, "active-challenge.json");
+var PENDING_LOGIN = join(CFG_DIR, "pending-login.json");
 var readJson = (p, d) => {
   try {
     return JSON.parse(readFileSync(p, "utf8"));
@@ -2090,8 +2146,19 @@ async function api(path, body, headers = {}) {
     data = { error: text.slice(0, 300) };
   }
   if (!res.ok) throw new Error(String(data.error || `HTTP ${res.status}`));
-  if (typeof data.token === "string") writeJson(CFG, { ...c, token: data.token, server: c.server || server() });
   return data;
+}
+async function post(path, body) {
+  const res = await fetch(server() + path, { method: "POST", headers: { "content-type": "application/json", "x-vibrometer-client": "cli" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, data };
+}
+var LOGIN_FIRST = "Sign in first with `vibrometer login` (in Claude Code, /vibrometer:login). It opens the site, where you approve this computer.";
+function requireLogin(what) {
+  if (cfg().token) return;
+  console.log(`
+Nothing was ${what}. ${LOGIN_FIRST}`);
+  process.exit(1);
 }
 function walk2(dir, out, since) {
   let entries;
@@ -2209,8 +2276,11 @@ ${CONSENT}`);
       console.log("\nNothing was uploaded. To upload exactly this selection, run the same command with --yes --confirm-rights (and --allow-improvement if you agree to the optional statement).");
     }
     console.log("To change it: --sessions <id,...>, --exclude <id,...>, --project / --exclude-project <name>, --days N, or --private (numbers only, no conversations, so no confirmation is needed).");
+    if (!cfg().token) console.log(`
+You're not signed in, and uploading needs an account. ${LOGIN_FIRST}`);
     return;
   }
+  requireLogin("uploaded");
   const consent = priv ? null : requireConsent(flags, "the same command");
   if (bytes > 36e6) {
     console.log(`
@@ -2237,52 +2307,96 @@ That's ${(bytes / 1e6).toFixed(0)}MB after compaction (max 36MB). Use --days or 
     console.log(
       consent.allowImprovement ? "   You let Vibrometer and its partners use these conversations, with secrets and identifiers removed, to improve their services. You can withdraw this on your account page." : "   Vibrometer and its partners won't use these conversations to improve their services (you didn't add --allow-improvement)."
     );
+  if (res.provisional) console.log(`
+\u26A0 ${provisionalMessage(res.reason)}`);
+  else if (v?.mode === "verified") console.log("   It's on the habit boards in the Pantheon (they update within a minute).");
   console.log(`
-\u2728 Your vibe check, every habit compared with other people, and your share link:
-   ${res.url}
+\u2728 See your vibe check, every habit compared with other people, and your share link at:
+   ${server()}/#you
 `);
-  console.log(`   Profile: ${server()}/u/${res.handle}`);
-  if (res.claimUrl) console.log(`   Open in your browser to edit school/city (one-time link, 15 min):
-   ${res.claimUrl}`);
+  console.log(`   Sign in there with the same account that you approved this computer with${res.handle ? ` (@${res.handle})` : ""}; it's kept on your account, so it shows on any device.`);
 }
-async function cmdChallenge(pos, flags) {
-  const slug = pos[0];
-  if (!slug) {
-    console.log(`Usage: vibrometer challenge <slug>. Browse challenges at ${server()}/challenges`);
-    process.exit(1);
-  }
-  const dir = resolve(String(flags.dir ?? "."));
-  const res = await api(`/api/challenges/${slug}/enroll`, {});
+function writeFiles(dir, files, overwrite) {
   mkdirSync(dir, { recursive: true });
-  for (const [name, content] of Object.entries(res.files)) {
+  for (const [name, content] of Object.entries(files)) {
     const p = join(dir, name);
-    if (existsSync(p) && !flags.force) {
+    if (existsSync(p) && !overwrite(name)) {
       console.log(`! ${name} already exists; leaving it (use --force to overwrite)`);
       continue;
     }
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, content);
   }
-  writeJson(ACTIVE, { nonce: res.nonce, slug, dir, entry: res.challenge.entry, startedAt: res.startedAt, server: server() });
+}
+async function cmdChallenge(pos, flags) {
+  const slug = pos[0];
+  if (!slug) {
+    const list = typeof define_CHALLENGES_default !== "undefined" ? define_CHALLENGES_default : [];
+    console.log("Usage: vibrometer challenge <slug> [--dir .]\n");
+    if (list.length) {
+      console.log("Challenges:");
+      const w = Math.max(...list.map((c) => c.slug.length));
+      for (const c of list) console.log(`   ${c.slug.padEnd(w)}  ${c.title}${c.difficulty ? ` (${c.difficulty})` : ""}`);
+      console.log("");
+    }
+    console.log(`Read about each one and see its leaderboards at ${server()}/#challenges`);
+    process.exit(1);
+  }
+  requireLogin("started");
+  const dir = resolve(String(flags.dir ?? "."));
+  const res = await api(`/api/challenges/${slug}/enroll`, {});
+  const started = res.started !== false && typeof res.startedAt === "number";
+  writeFiles(dir, res.files, (name) => name === "CHALLENGE.md" || !!flags.force);
+  writeJson(ACTIVE, { nonce: res.nonce, slug, dir, entry: res.challenge.entry, startedAt: started ? res.startedAt : null, started, server: server() });
   console.log(`
-\u{1F3C1} Enrolled in "${res.challenge.title}". The clock started at ${new Date(res.startedAt).toLocaleTimeString()}.`);
+\u{1F4CB} The ticket for "${res.challenge.title}" is in ${join(dir, "CHALLENGE.md")}.`);
   console.log(`   Challenge nonce: ${res.nonce}`);
+  console.log(
+    started ? `   This server started the clock at ${new Date(res.startedAt).toLocaleTimeString()}.` : "   The clock has NOT started. Read the ticket, then start the clock with: vibrometer start (in Claude Code, /vibrometer:start)"
+  );
   if (res.challenge.leaderboard === false) console.log("   This is a practice challenge: results show on its board but don't count toward the season rankings.");
   else
     console.log(
-      res.ranked ? "   This is your RANKED attempt: your best passing submission goes on the leaderboard." : `   Practice attempt #${res.attempt}: only your first attempt is ranked, so this one won't change your leaderboard spot.`
+      res.ranked ? "   This is your RANKED attempt: your best submission goes on the leaderboard if the session shows that you directed the work." : `   Practice attempt #${res.attempt}: only your first attempt is ranked, so this one won't change your leaderboard spot.`
     );
+  const sh = res.challenge.stakeholder;
+  if (sh) console.log(`   Once the clock runs, you can ask ${sh.name ?? "the stakeholder"} ${sh.questions} questions. They're yours to ask: vibrometer ask "your question"`);
+  if (res.challenge.drops?.length) console.log(`   Follow-ups arrive ${res.challenge.drops.map((d) => `${d.afterMinutes} min`).join(", ")} after the start. Get them with: vibrometer update`);
+  if (res.challenge.baseline) console.log(`   The model alone scored ${res.challenge.baseline.testsPassed}/${res.challenge.baseline.testsTotal} on this challenge; the Olympiad ranks how far above that you lead it.`);
+  console.log(`
+   This challenge measures how YOU direct an AI agent. You are the lead and the agent is your tool:
+   a session where the agent solves it alone, with only "go", "continue" or "yes" from you, is graded
+   as practice and not ranked. Time target: ${res.challenge.timeLimitMinutes} min.
+`);
+}
+async function cmdStart(flags) {
+  const active = activeOrExit();
+  if (active.started && active.startedAt) {
+    console.log(`The clock of "${active.slug}" already started at ${new Date(active.startedAt).toLocaleTimeString()}.`);
+    return;
+  }
+  const dir = String(flags.dir ?? active.dir);
+  const res = await api(`/api/challenges/${active.slug}/start`, { nonce: active.nonce });
+  writeFiles(dir, res.files, (name) => name === "CHALLENGE.md" || !!flags.force);
+  writeJson(ACTIVE, { ...active, dir, entry: res.challenge.entry, startedAt: res.startedAt, started: true });
+  console.log(`
+\u{1F3C1} The clock for "${res.challenge.title}" started at ${new Date(res.startedAt).toLocaleTimeString()}.`);
+  console.log(`   Challenge nonce: ${res.nonce}`);
   const top = [...new Set(Object.keys(res.files).map((f) => f.includes("/") ? f.split("/")[0] + "/" : f))];
   console.log(`   Files written to ${dir}: ${top.join(", ")}`);
-  console.log(`
-   Read CHALLENGE.md, implement ${res.challenge.entry}, and test it with: node --test`);
-  console.log(`   When ready, submit from THIS session: vibrometer submit (or /vibrometer:submit)`);
+  console.log(`   The entry file is ${res.challenge.entry}. When you're ready, submit from THIS session: vibrometer submit (or /vibrometer:submit)`);
   const sh = res.challenge.stakeholder;
-  if (sh) console.log(`   You can ask ${sh.name ?? "the stakeholder"} ${sh.questions} questions: vibrometer ask "your question"`);
+  if (sh) console.log(`   You can ask ${sh.name ?? "the stakeholder"} ${sh.questions} questions: vibrometer ask "your question". Choosing them is your call.`);
   for (const d of res.challenge.drops ?? [])
-    console.log(`   A follow-up arrives ${d.afterMinutes} min in (${new Date(d.at).toLocaleTimeString()}). Get it with: vibrometer update`);
-  console.log(`   Ranked on wall-clock time, turns and tokens. Target: ${res.challenge.timeLimitMinutes} min.
+    if (d.at) console.log(`   A follow-up arrives ${d.afterMinutes} min in (${new Date(d.at).toLocaleTimeString()}). Get it with: vibrometer update`);
+  console.log(`   Ranked by hidden tests passed, then wall-clock time; only if the session shows you directing the work. Target: ${res.challenge.timeLimitMinutes} min.
 `);
+}
+var isStarted = (a) => a.started !== false && !!a.startedAt;
+function startedOrExit(a) {
+  if (isStarted(a)) return;
+  console.log(`The clock of "${a.slug}" hasn't started. Read CHALLENGE.md, then start it with: vibrometer start (in Claude Code, /vibrometer:start)`);
+  process.exit(1);
 }
 function activeOrExit() {
   const active = readJson(ACTIVE, null);
@@ -2295,6 +2409,7 @@ function activeOrExit() {
 var fetchDrops = (a) => api(`/api/challenges/${a.slug}/drops?nonce=${encodeURIComponent(a.nonce)}`);
 async function cmdUpdate(flags) {
   const active = activeOrExit();
+  startedOrExit(active);
   const dir = String(flags.dir ?? active.dir);
   const r = await fetchDrops(active);
   const applied = new Set(active.appliedDrops ?? []);
@@ -2322,6 +2437,7 @@ ${d.change.trim()}
 }
 async function cmdAsk(pos) {
   const active = activeOrExit();
+  startedOrExit(active);
   const question = pos.join(" ").trim();
   if (!question) {
     const h = await api(`/api/challenges/${active.slug}/ask?nonce=${encodeURIComponent(active.nonce)}`);
@@ -2332,11 +2448,32 @@ A: ${q.answer}`);
 ${h.used} of ${h.allowed} questions used. Ask with: vibrometer ask "your question"`);
     return;
   }
-  const r = await api(`/api/challenges/${active.slug}/ask`, { nonce: active.nonce, question });
+  const r = await api(`/api/challenges/${active.slug}/ask`, { nonce: active.nonce, question, context: askContext(active) });
   console.log(`
 ${r.name}: ${r.answer}
 `);
   console.log(`   ${r.used} of ${r.allowed} questions used.`);
+}
+function askContext(active) {
+  const none = { afterHumanPrompt: null, msSincePrompt: null, asksSincePrompt: null, promptWords: null };
+  try {
+    const f = findChallengeTranscript(active.nonce, active.startedAt ?? Date.now());
+    if (!f) return none;
+    const s = parseSession(readFileSync(f, "utf8"), "challenge");
+    if (!s) return none;
+    let lastPrompt = null;
+    let asks = 0;
+    for (const e of s.events) {
+      if (e.kind === "prompt") {
+        lastPrompt = { t: e.t, text: e.text };
+        asks = 0;
+      } else if (e.kind === "tool" && askQuestion(e.detail)) asks++;
+    }
+    if (!lastPrompt) return { ...none, afterHumanPrompt: false };
+    return { afterHumanPrompt: asks <= 1, msSincePrompt: Math.max(0, Date.now() - lastPrompt.t), asksSincePrompt: asks, promptWords: contentWords(lastPrompt.text).length };
+  } catch {
+    return none;
+  }
 }
 function findChallengeTranscript(nonce, startedAt) {
   const candidates = findTranscripts(startedAt - 36e5, 500).filter((f) => !f.includes(`${"/"}subagents${"/"}`));
@@ -2350,6 +2487,7 @@ function findChallengeTranscript(nonce, startedAt) {
 }
 async function cmdSubmit(flags) {
   const active = activeOrExit();
+  startedOrExit(active);
   try {
     const d = await fetchDrops(active);
     const missing = d.released.filter((x) => !(active.appliedDrops ?? []).includes(x.index));
@@ -2412,24 +2550,102 @@ ${r.passed ? "\u2705 PASSED" : "\u274C NOT YET"}: ${r.testsPassed}/${r.testsTota
   const review = r.flags.filter((f) => f.review);
   console.log(`   ${r.verified ? "\u{1F512} Verified: the transcript checks out" : "\u26A0 Unverified: " + hard.map((f) => f.message).join("; ")}`);
   if (review.length) console.log(`   Flagged for review (the hidden tests still decide the score): ${review.map((f) => f.message).join("; ")}`);
-  if (!r.ranked) console.log(`   (Practice attempt #${r.attempt}: not ranked)`);
+  if (r.baseline) console.log(`   \u{1F916} The model alone scored ${r.baseline.testsPassed}/${r.baseline.testsTotal}: you are ${r.baseline.gainPoints >= 0 ? "+" : ""}${r.baseline.gainPoints} points ${r.baseline.gainPoints >= 0 ? "above" : "against"} it`);
+  if (r.direction) console.log(`   \u{1F9ED} Your direction: ${r.direction.substantive} of ${r.direction.prompts} prompts directed the work; ${r.direction.humanAsks} of ${r.direction.asks} stakeholder questions were yours`);
+  if (r.practiceReason) console.log(`   \u26A0 ${r.practiceReason}`);
+  else if (!r.ranked) console.log(`   (Practice attempt #${r.attempt}: not ranked)`);
   if (r.ranks) {
     const fmt = (x) => x ? `#${x.rank}/${x.of}` : "n/a";
-    console.log(`   Ranks: fastest ${fmt(r.ranks.time)} \xB7 fewest turns ${fmt(r.ranks.turns)} \xB7 fewest tokens ${fmt(r.ranks.tokens)}`);
+    console.log(`   Ranks: fastest ${fmt(r.ranks.time)} \xB7 fewest prompts (above the AI-alone score) ${fmt(r.ranks.turns)} \xB7 fewest tokens ${fmt(r.ranks.tokens)}`);
   }
   console.log(`   Leaderboard: ${r.leaderboardUrl}
    Profile: ${r.profileUrl}
 `);
   if (!r.passed) console.log("   You can resubmit as many times as you like. The clock keeps running.");
 }
-function cmdLogin(pos, flags) {
-  const token = pos[0];
-  if (!token) {
-    console.log(`Usage: vibrometer login <token> [--server URL]. Get a token at ${server()}/me`);
+function openBrowser(url) {
+  const [cmd, args2] = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url.replace(/&/g, "^&")]] : ["xdg-open", [url]];
+  try {
+    const child = spawn(cmd, args2, { stdio: "ignore", detached: true });
+    child.on("error", () => {
+    });
+    child.unref();
+  } catch {
+  }
+}
+async function cmdLogin(pos, flags) {
+  if (typeof flags.server === "string") writeJson(CFG, { ...cfg(), server: flags.server.replace(/\/$/, "") });
+  const pasted = typeof flags.token === "string" ? flags.token : pos[0];
+  if (pasted) {
+    writeJson(CFG, { ...cfg(), token: pasted, server: server() });
+    console.log(`Saved. Using server ${server()}`);
+    return;
+  }
+  let p = flags.wait ? readJson(PENDING_LOGIN, null) : null;
+  if (flags.wait && (!p || p.expiresAt < Date.now() || p.server !== server())) {
+    console.log("There's no sign-in waiting for approval. Start one with: vibrometer login");
     process.exit(1);
   }
-  writeJson(CFG, { ...cfg(), token, ...flags.server ? { server: String(flags.server).replace(/\/$/, "") } : {} });
-  console.log(`Saved. Using server ${server()}`);
+  if (!p) {
+    const r = await post("/api/cli/login/start", {});
+    if (r.status !== 200) throw new Error(String(r.data.error || `HTTP ${r.status}`));
+    const d = r.data;
+    p = { deviceCode: d.deviceCode, userCode: d.userCode, url: d.verificationUrlComplete, interval: d.interval, expiresAt: Date.now() + d.expiresIn * 1e3, server: server() };
+    writeJson(PENDING_LOGIN, p);
+    console.log(`
+To sign in, open this page in your browser:
+
+   ${d.verificationUrlComplete}
+`);
+    console.log(`Check that it shows this code, then approve:
+
+   ${d.userCode}
+`);
+    console.log(`(Or go to ${d.verificationUrl} and enter the code.) The code expires in ${Math.round(d.expiresIn / 60)} minutes.`);
+    if (!flags["no-browser"]) openBrowser(d.verificationUrlComplete);
+    if (flags["no-wait"]) {
+      console.log("\nAfter approving, finish with: vibrometer login --wait");
+      return;
+    }
+  }
+  console.log("Waiting for approval\u2026");
+  let interval = Math.max(1, p.interval);
+  while (Date.now() < p.expiresAt) {
+    await new Promise((res) => setTimeout(res, interval * 1e3));
+    let r;
+    try {
+      r = await post("/api/cli/login/poll", { deviceCode: p.deviceCode });
+    } catch {
+      continue;
+    }
+    const status = r.data.status;
+    if (status === "pending") continue;
+    if (status === "slow_down") {
+      interval += 5;
+      continue;
+    }
+    writeJson(PENDING_LOGIN, null);
+    if (status === "approved" && typeof r.data.token === "string") {
+      writeJson(CFG, { ...cfg(), token: r.data.token, server: server() });
+      console.log(`
+Signed in${r.data.handle ? ` as @${r.data.handle}` : ""} on ${server()}.`);
+      return;
+    }
+    if (status === "denied") console.log("\nThe sign-in was denied in the browser. Nothing changed.");
+    else if (status === "expired") console.log("\nThe code expired or was already used. Run vibrometer login again.");
+    else console.log(`
+Sign-in failed: ${String(r.data.error || `HTTP ${r.status}`)}`);
+    process.exit(1);
+  }
+  writeJson(PENDING_LOGIN, null);
+  console.log("\nThe code expired before it was approved. Run vibrometer login again.");
+  process.exit(1);
+}
+async function cmdLogout() {
+  const c = cfg();
+  if (c.token) await api("/api/cli/logout", {}).catch(() => console.log("(Couldn't reach the server to revoke the token; it's removed from this computer.)"));
+  writeJson(CFG, { ...c, token: void 0 });
+  console.log("Signed out on this computer.");
 }
 async function main() {
   const { cmd, pos, flags } = args();
@@ -2441,6 +2657,8 @@ async function main() {
       return cmdAnalyze(flags);
     case "challenge":
       return cmdChallenge(pos, flags);
+    case "start":
+      return cmdStart(flags);
     case "submit":
       return cmdSubmit(flags);
     case "update":
@@ -2449,34 +2667,43 @@ async function main() {
       return cmdAsk(pos);
     case "login":
       return cmdLogin(pos, flags);
-    case "link": {
-      const r = await api("/api/claim", {});
-      console.log(`One-time sign-in link for your browser (15 min):
-${r.url}`);
-      return;
-    }
+    case "logout":
+      return cmdLogout();
     case "status": {
       const c = cfg();
-      console.log(JSON.stringify({ server: server(), loggedIn: !!c.token, activeChallenge: readJson(ACTIVE, null), transcriptRoots: transcriptRoots() }, null, 2));
+      let account = null;
+      if (c.token) {
+        try {
+          const me = await api("/api/me");
+          account = { signedIn: !!me.user?.signedIn, handle: me.user?.handle ?? null };
+        } catch {
+        }
+      }
+      const signedIn = account ? account.signedIn : !!c.token;
+      console.log(JSON.stringify({ server: server(), signedIn, handle: account?.handle ?? null, activeChallenge: readJson(ACTIVE, null), transcriptRoots: transcriptRoots() }, null, 2));
+      if (!signedIn) console.log(LOGIN_FIRST);
       return;
     }
     default:
       console.log(`vibrometer: see how you code with AI
 
+  login [--server URL] [--no-browser]
+                           sign in: approve this computer on the site (uploads and challenges need it)
+  logout                   sign out on this computer
   list [--days 30] [--json]   your conversations, grouped by project, with ids
   analyze [--days 30] [--sessions id,...] [--exclude id,...] [--project name,...] [--exclude-project name,...]
           [--private] [--yes --confirm-rights [--allow-improvement]]
           [--handle h] [--school S] [--major M] [--city C] [--country X] [--grad-year Y] [--open-to-work]
                            shows what would be sent; add --yes --confirm-rights to upload it
                            (--private = numbers only, no conversations, no confirmation needed)
-  link                     one-time link that signs your browser into this profile
-  challenge <slug> [--dir .]   enroll in a challenge and start the clock
+  challenge <slug> [--dir .]   enroll in a challenge and get its ticket (CHALLENGE.md); the clock doesn't start yet
+  start                        start the clock and write the starter files
   update                       fetch follow-ups (new files, changed requirements) released during the challenge
   ask "question"               ask the challenge's stakeholder (limited questions); no question lists past answers
   submit --confirm-rights [--allow-improvement] [--transcript path]
                                grade your solution and post to the leaderboard (uploads this session's log)
-  login <token> [--server URL] link to your profile (token from ${server()}/me)
-  status                   show config
+  login --token <token>    sign in with a token from ${server()}/me instead of the browser
+  status                   show the server and whether you're signed in
 
   --confirm-rights      you confirm: "${RIGHTS_STATEMENT}"
   --allow-improvement   optional, off by default: "${IMPROVEMENT_STATEMENT}"
