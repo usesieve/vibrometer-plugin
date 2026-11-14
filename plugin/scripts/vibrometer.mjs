@@ -176,8 +176,8 @@ var SIGNALS = [
   { key: "corrections", name: "Corrections", scale: 1e3, prior: cut([0.02, 0.08, 0.2], "corrections"), good: -1, value: (m) => fromLabels(m, "corrections", per(m.corrections, readPrompts(m), 3)), fmt: pct, line: (v) => `You correct the agent on ${v} of your prompts`, they: (v, w) => `${w} corrects the agent on ${v} of their prompts` },
   // interrupts: Log. Anthropic: people interrupt on about 5% of turns when new and about 9% when experienced [A1], i.e. 0.5-0.9 per 10 prompts, so the old middle of 0.3 was too low.
   { key: "interrupts", name: "Interrupts per 10 prompts", scale: 10, prior: [0.1, 0.7, 2], log: true, value: (m) => m.humanTurns >= 5 ? m.interrupts / m.humanTurns * 10 : null, fmt: n1, line: (v) => `You stop the agent mid-run ${v} times per 10 prompts`, they: (v, w) => `${w} stops the agent mid-run ${v} times per 10 prompts` },
-  // reads: Share. Claude Code's Edit tool needs the file read first, so most Claude Code edits are read first; Codex patches and new files pull it down.
-  { key: "reads", name: "Reads before editing", scale: 1e3, prior: [0.35, 0.7, 0.95], good: 1, value: (m) => m.editedFiles >= 2 ? m.readBeforeEditRatio : null, fmt: pct, line: (v) => `${v} of the files that you change are read first`, they: (v, w) => `${v} of the files that ${w} changes are read first` },
+  // reads: Share. Claude Code's Edit tool needs the file read first; Codex existing-file patches need not. Known new files are excluded from the observed sample.
+  { key: "reads", name: "Reads before editing", scale: 1e3, prior: [0.35, 0.7, 0.95], good: 1, value: (m) => (m.readBeforeEditFiles ?? m.editedFiles) >= 2 ? m.readBeforeEditRatio : null, fmt: pct, line: (v) => `${v} of the files that you change are read first`, they: (v, w) => `${v} of the files that ${w} changes are read first` },
   // plans: Share. Plan mode is common among heavy users; little change.
   { key: "plans", name: "Plans before coding", scale: 1e3, prior: [0.1, 0.45, 0.85], good: 1, value: (m) => per(m.sessionsPlanFirst, readPlanSessions(m), 1), fmt: pct, line: (v) => `You plan before the first edit in ${v} of sessions`, they: (v, w) => `${w} plans before the first edit in ${v} of sessions` },
   // subagents: Log. Claude Code starts Explore and Plan subagents on its own and heavy users run their own, while Codex sessions and quick questions have none. 3-8 per session is a strong but normal heavy user (84-97).
@@ -395,6 +395,11 @@ function linkValues(v) {
 function exactPercentileOf(q, v) {
   if (!q?.length) return 50;
   const last = q.length - 1;
+  const firstEqual = q.indexOf(v);
+  if (firstEqual >= 0) {
+    const lastEqual = q.lastIndexOf(v);
+    return last ? 0.5 + 99 * (firstEqual + lastEqual) / (2 * last) : 50;
+  }
   let lo = 0;
   while (lo < last && q[lo + 1] === q[lo]) lo++;
   let hi = last;
@@ -1496,6 +1501,7 @@ function codexBuilder(fallbackId = "session") {
     let path;
     let paths;
     let deleted;
+    let create = false;
     if (name === "apply_patch" || command && command.includes("apply_patch")) {
       const patch = typeof input.content === "string" ? input.content : typeof input.input === "string" ? input.input : command ?? "";
       const lines = patch.split("\n");
@@ -1503,6 +1509,7 @@ function codexBuilder(fallbackId = "session") {
       old = lines.filter((l) => l.startsWith("-") && !l.startsWith("---")).map((l) => l.slice(1)).join("\n");
       path = patch.match(/\*\*\* (?:Update|Add) File: (.+)/)?.[1];
       const heads = [...patch.matchAll(/\*\*\* (Update|Add|Delete) File: (.+)/g)];
+      create = heads.find((h) => h[2].trim() === path?.trim())?.[1] === "Add";
       if (heads.length > 1) paths = heads.map((h) => h[2].trim());
       const dels = heads.filter((h) => h[1] === "Delete").map((h) => h[2].trim());
       if (dels.length) {
@@ -1526,6 +1533,7 @@ function codexBuilder(fallbackId = "session") {
       path,
       written,
       linesWritten: originalLines(written),
+      ...create ? { create: true } : {},
       ...old ? { old } : {},
       ...paths ? { paths } : {},
       ...deleted ? { deleted } : {}
@@ -3378,6 +3386,12 @@ function peakSubagents(spans) {
 // src/lib/analyzer/metrics.ts
 var CATS = ["read", "search", "edit", "exec", "test", "build", "git", "web", "agent", "plan", "ask", "mcp", "other"];
 var IDLE_GAP_MS2 = 10 * 60 * 1e3;
+function sameReadPath(read, edited) {
+  const normalize = (p) => p.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "").replace(/\/\.\//g, "/");
+  const a = normalize(read), b = normalize(edited);
+  const relative2 = (p) => !/^(?:\/|~\/|[a-z]:\/)/i.test(p);
+  return a === b || relative2(a) && !relative2(b) && a.includes("/") && b.endsWith(`/${a}`) || relative2(b) && !relative2(a) && b.includes("/") && a.endsWith(`/${b}`);
+}
 var TOKEN_FIELDS = ["input", "output", "cacheRead", "cacheWrite5m", "cacheWrite1h"];
 var noTokens = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 });
 var billed = (u) => {
@@ -3429,6 +3443,7 @@ function computeMetrics(sessions, opts = {}) {
     sessionsPlanFirst: 0,
     sessionsWithEdits: 0,
     editedFiles: 0,
+    readBeforeEditFiles: 0,
     readBeforeEditRatio: 0,
     linesWritten: 0,
     testRuns: 0,
@@ -3666,9 +3681,10 @@ function computeMetrics(sessions, opts = {}) {
             if (e.path && !editedPaths.has(e.path)) {
               editedPaths.add(e.path);
               editedTotal++;
-              const isCreate = !!e.create && !readPaths.has(e.path);
+              const readFirst = [...readPaths].some((r8) => sameReadPath(r8, e.path));
+              const isCreate = !!e.create && !readFirst;
               if (isCreate) editedTotal--;
-              else if (readPaths.has(e.path) || [...readPaths].some((r8) => r8.endsWith(e.path.split("/").pop()))) editedReadFirst++;
+              else if (readFirst) editedReadFirst++;
             }
           }
           if (e.category === "test" || e.category === "build") {
@@ -3742,6 +3758,7 @@ function computeMetrics(sessions, opts = {}) {
   m.avgPromptChars = promptLens.length ? promptLens.reduce((a, b) => a + b, 0) / promptLens.length : 0;
   m.medianPromptChars = median(promptLens);
   m.readBeforeEditRatio = editedTotal > 0 ? editedReadFirst / editedTotal : m.sessionsWithEdits ? 0.5 : 0;
+  m.readBeforeEditFiles = editedTotal;
   m.nightOwlShare = m.humanTurns ? night / m.humanTurns : 0;
   m.weekendShare = m.humanTurns ? weekend / m.humanTurns : 0;
   const minutes = { activeMinutes: m.activeMinutes, spanMinutes: m.spanMinutes, agentBusyMinutes: m.agentBusyMinutes, agentWaitMinutes: m.agentWaitMinutes, redoMinutes: churn.redoMinutes };
@@ -4806,21 +4823,38 @@ var median2 = (xs) => {
   const s = [...xs].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
 };
+function spreadIndices(length, limit = MAX_PROMPTS) {
+  if (!length || !limit) return [];
+  const out = [0];
+  if (length === 1 || limit === 1) return out;
+  out.push(length - 1);
+  const gaps = [[0, length - 1]];
+  for (let i = 0; i < gaps.length && out.length < limit; i++) {
+    const [left, right] = gaps[i];
+    if (right - left <= 1) continue;
+    const mid = Math.floor((left + right) / 2);
+    out.push(mid);
+    gaps.push([left, mid], [mid, right]);
+  }
+  return out;
+}
 function pickPrompts(sessions) {
-  const per2 = sessions.map((s) => s.events.filter((e) => e.kind === "prompt" && !e.slash).map((e) => scrubPrompt(e.text)).filter((t) => t.length >= 12)).filter((p) => p.length);
+  const per2 = [...sessions].sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id)).map((s) => s.events.filter((e) => e.kind === "prompt" && !e.slash).map((e) => scrubPrompt(e.text)).filter((t) => t.length >= 12)).filter((p) => p.length);
   const out = [];
   const seen = /* @__PURE__ */ new Set();
-  for (let round2 = 0; out.length < MAX_PROMPTS && per2.some((p) => p.length > round2); round2++) {
-    for (const p of per2) {
+  const selected = spreadIndices(per2.length).map((i) => {
+    const p = per2[i];
+    return spreadIndices(p.length).map((j) => p[j]);
+  });
+  for (let round2 = 0; out.length < MAX_PROMPTS && selected.some((p) => p.length > round2); round2++) {
+    for (const p of selected) {
       if (out.length >= MAX_PROMPTS) break;
-      const i = round2 === 0 ? 0 : Math.min(p.length - 1, Math.round(round2 * p.length / 4));
-      const t = p[i];
+      const t = p[round2];
       if (t && !seen.has(t)) {
         seen.add(t);
         out.push(t);
       }
     }
-    if (round2 > 6) break;
   }
   return out;
 }
@@ -4831,27 +4865,38 @@ function digestHabits(values, ref) {
     return { key: s.key, name: s.name, value: s.fmt(v), pct: percentilePrecise(s.key, v, ref) };
   });
 }
+function narrativeHabits(d) {
+  const r8 = d.rhythm;
+  const complete = r8.timing ? r8.timing.datedPrompts > 0 && r8.timing.datedPrompts === r8.timing.totalPrompts : r8.activeDays > 0;
+  const clock = /* @__PURE__ */ new Set(["night", "weekend", "peakHour"]);
+  const byName = new Map(SIGNALS.map((s) => [s.name, s.key]));
+  return complete ? d.habits : d.habits.filter((h) => !clock.has(h.key ?? byName.get(h.name) ?? ""));
+}
 function buildNarrativeDigest(sessions, values, ref, time = {}) {
-  const habits = digestHabits(values, ref);
   const local = localTime(time);
-  const prompts = sessions.flatMap((s) => s.events.filter((e) => e.kind === "prompt" && !e.slash));
-  const at = sessions.flatMap((s) => s.events.filter((e) => e.kind === "prompt" && !e.slash).map((p) => local(p.t, s)));
-  const night = at.filter((d) => d.hour >= 22 || d.hour < 5).length;
+  const human = sessions.map((s) => ({ s, prompts: s.events.filter((e) => e.kind === "prompt" && !e.slash) })).filter((x) => x.prompts.length);
+  const prompts = human.flatMap((x) => x.prompts);
+  const dated = (t) => Number.isFinite(t) && t > 0 && t <= 864e13;
+  const at = human.flatMap(({ s, prompts: ps }) => ps.filter((p) => dated(p.t)).map((p) => local(p.t, s)));
+  const durations = human.filter(({ s }) => dated(s.startedAt) && dated(s.endedAt) && s.endedAt >= s.startedAt).map(({ s }) => (s.endedAt - s.startedAt) / 36e5).filter((hours) => hours <= 1e4);
+  const night = at.filter((d) => d.hour >= 23 || d.hour < 5).length;
   const weekend = at.filter((d) => d.weekday === 0 || d.weekday === 6).length;
   const days = new Set(at.map((d) => d.dateKey)).size;
   const models = [...new Set(sessions.flatMap((s) => s.models))].filter(Boolean).slice(0, 6);
+  const rhythm = {
+    sessions: human.length,
+    activeDays: days,
+    nightShare: at.length ? Math.round(night / at.length * 100) / 100 : 0,
+    weekendShare: at.length ? Math.round(weekend / at.length * 100) / 100 : 0,
+    promptsPerSession: median2(human.map((x) => x.prompts.length)),
+    longestSessionHours: Math.round(Math.max(0, ...durations) * 10) / 10,
+    timing: { datedPrompts: at.length, totalPrompts: prompts.length, durationSessions: durations.length },
+    models
+  };
   return {
     v: NARRATIVE_VERSION,
-    habits,
-    rhythm: {
-      sessions: sessions.filter((s) => s.events.some((e) => e.kind === "prompt")).length,
-      activeDays: days,
-      nightShare: prompts.length ? Math.round(night / prompts.length * 100) / 100 : 0,
-      weekendShare: prompts.length ? Math.round(weekend / prompts.length * 100) / 100 : 0,
-      promptsPerSession: median2(sessions.map((s) => s.events.filter((e) => e.kind === "prompt").length).filter((n) => n > 0)),
-      longestSessionHours: Math.round(Math.max(0, ...sessions.map((s) => (s.endedAt - s.startedAt) / 36e5)) * 10) / 10,
-      models
-    },
+    habits: narrativeHabits({ habits: digestHabits(values, ref), rhythm }),
+    rhythm,
     prompts: pickPrompts(sessions)
   };
 }
@@ -5214,7 +5259,11 @@ To write your vibe type, also sent:
   console.log(`
    Your habit numbers: ${d.habits.map((h) => `${h.name} ${h.value}`).join("; ")}.`);
   const r8 = d.rhythm;
-  console.log(`   When you work: ${r8.sessions} sessions over ${r8.activeDays} active days, ${Math.round(r8.nightShare * 100)}% of prompts at night, ${Math.round(r8.weekendShare * 100)}% on weekends, ${r8.promptsPerSession} prompts per session (median), longest session ${r8.longestSessionHours} h${r8.models.length ? `, models ${r8.models.join(", ")}` : ""}.`);
+  const hasDates = r8.timing ? r8.timing.datedPrompts > 0 : r8.activeDays > 0;
+  const clock = hasDates ? `over ${r8.activeDays} active days, ${Math.round(r8.nightShare * 100)}% of ${r8.timing ? "dated " : ""}prompts at night, ${Math.round(r8.weekendShare * 100)}% on weekends` : "with timing unavailable";
+  const coverage = r8.timing ? `, dates available for ${r8.timing.datedPrompts} of ${r8.timing.totalPrompts} prompts` : "";
+  const duration2 = r8.timing?.durationSessions === 0 ? "session duration unknown" : `longest session ${r8.longestSessionHours} h`;
+  console.log(`   When you work: ${r8.sessions} sessions ${clock}${coverage}, ${r8.promptsPerSession} prompts per session (median), ${duration2}${r8.models.length ? `, models ${r8.models.join(", ")}` : ""}.`);
   console.log(`   The ${d.prompts.length === 1 ? "prompt" : `${d.prompts.length} prompts`}, exactly as sent:`);
   d.prompts.forEach((p, i) => console.log(`   ${String(i + 1).padStart(2)}. ${p}`));
 }
