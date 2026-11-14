@@ -5,7 +5,7 @@ argument-hint: "[--days 30]"
 allowed-tools: Bash(node:*)
 ---
 
-The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUGIN_ROOT` is empty, it's at `../../scripts/vibrometer.mjs` relative to this file). Nothing is uploaded unless the command includes `--yes`, and conversations are uploaded only when it also includes `--confirm-rights`. Follow these steps in order. Never add `--yes` before the user has confirmed the selection, never add `--confirm-rights` unless the user has said yes to the first statement in step 4, and never add `--allow-improvement` unless the user has said yes to the second statement.
+The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUGIN_ROOT` is empty, it's at `../../scripts/vibrometer.mjs` relative to this file). Nothing is uploaded unless the command includes `--yes`, and conversations are uploaded only when it also includes `--confirm-rights`. Follow these steps in order. Never add `--yes` before the user has confirmed the selection, never add `--confirm-rights` unless the user has said yes to the first statement in step 4, never add `--allow-improvement` unless the user has said yes to the second statement, and never add `--allow-research` unless they have said yes to the third.
 
 0. **Make sure the user is signed in.** Uploading needs a Vibrometer account.
 
@@ -21,9 +21,9 @@ The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUG
    node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" list $ARGUMENTS
    ```
 
-   This prints each conversation from the last 30 days (or `--days N`) with an 8-character id, date, prompt count and first prompt, grouped by project.
+   This prints each conversation from the last 30 days (or `--days N`) with an 8-character id, date, prompt count and first prompt, grouped by project. If the user wants to see how their habits changed over time ("Your habits over time" on the site, by day, week, month, quarter or year), include their whole history: `--days 365 --max 2000`.
 
-2. **Ask the user what to include**, and tell them this first, in your own words: *don't upload any conversation that contains personal, sensitive or confidential information, such as customer or patient data, credentials, financial or health details, or code and documents they aren't allowed to share. Common secrets are stripped automatically, but not everything can be recognised.*
+2. **Ask the user what to include**, and tell them this first, in your own words: *don't upload any conversation that contains personal, sensitive or confidential information, such as customer or patient data, credentials, financial or health details, or code and documents they aren't allowed to share. Common secrets are stripped and home folders in file paths are replaced with ~ automatically, but not everything can be recognised.*
 
    Show the projects with how many conversations each has, and offer simple choices: everything listed, only some projects, everything except some projects, or specific conversations. If the user picks by conversation, show the ids so they can choose. Point out any project whose name suggests work for a client or employer, and ask about it rather than including it by default.
 
@@ -33,9 +33,9 @@ The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUG
    node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" analyze --exclude-project acme-client --exclude 3f2a91c0
    ```
 
-   It prints a preview of their vibe check and the list of conversations that would be uploaded. Show the user that list and ask them to confirm the selection. Offer `--private` if they'd rather send only aggregate numbers and no conversation text. A `--private` upload sends no conversations, so skip step 4 for it and run the same command with `--yes` once they confirm.
+   It prints a preview of their vibe check and the list of conversations that would be uploaded (if it prints a short summary instead, run it again with `--preview` added). Show the user that list, tell them that to write their vibe type our server sends their prompts, with secrets, emails, links and paths removed, to our AI provider (not kept; `--private` sends none unless `--vibe-type` is added), and ask them to confirm the selection. Offer `--private` if they'd rather send only aggregate numbers and no conversation text. A `--private` upload sends no conversations, so skip step 4 for it and run the same command with `--yes` once they confirm.
 
-4. **Ask about the two statements before uploading conversations.** Show the user both statements word for word, exactly as below (they are also printed by the preview). Don't paraphrase or shorten them.
+4. **Ask about the statements before uploading conversations.** Show the user all three statements word for word, exactly as below (they are also printed by the preview). Don't paraphrase or shorten them.
 
    The first statement is required:
 
@@ -43,14 +43,20 @@ The script is at `${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs` (if `CLAUDE_PLUG
 
    The second statement is optional, and the note under it is part of what you show:
 
-   > Let Vibrometer and its partners use these conversations, with secrets and identifiers removed, to improve their services.
+   > Let Vibrometer and its partners use these conversations, with common secrets, email addresses and home-folder names removed, to improve their services.
+   >
+   > Optional. It applies only to this upload, and you can withdraw it later from your account page.
+
+   The third statement is also optional, and separate from the second; the note under it is part of what you show:
+
+   > Let Vibrometer use the numbers measured from this upload (never the conversations themselves) to study which habits lead to better results, and publish findings that can't identify anyone.
    >
    > Optional. It applies only to this upload, and you can withdraw it later from your account page.
 
    - Ask whether the first statement is true for the conversations they chose, and wait for an explicit yes. Never assume it: agreeing to the selection in step 3, asking you to "go ahead", or having confirmed it for an earlier upload doesn't count. If they say no or aren't sure, don't upload. Suggest removing the conversations in question (back to step 2) or using `--private`.
-   - Ask about the second statement as a separate question, after the first. The answer is no unless they clearly say yes. Tell them that saying no doesn't change their vibe check or whether they can upload.
+   - Ask about the second statement as a separate question, after the first, and then the third as its own question. For each, the answer is no unless they clearly say yes. Tell them that saying no doesn't change their vibe check or whether they can upload.
 
-5. **Upload only after both answers**, by running the same command as in step 3 with `--yes --confirm-rights` added, and with `--allow-improvement` as well only if they said yes to the second statement:
+5. **Upload only after all three answers**, by running the same command as in step 3 with `--yes --confirm-rights` added, with `--allow-improvement` only if they said yes to the second statement, and `--allow-research` only if they said yes to the third:
 
    ```bash
    node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" analyze --exclude-project acme-client --exclude 3f2a91c0 --yes --confirm-rights

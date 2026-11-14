@@ -4808,7 +4808,7 @@ function* timelineSteps(sessions, opts) {
 }
 
 // src/lib/analyzer/narrative.ts
-var NARRATIVE_VERSION = 2;
+var NARRATIVE_VERSION = 3;
 var MAX_PROMPTS = 40;
 var PROMPT_CHARS = 280;
 var VIBE_TYPE_SCRUB = `each cut to ${PROMPT_CHARS} characters, with secrets, emails and links removed and file paths cut to the file name`;
@@ -4904,7 +4904,7 @@ var TRAIT_SIGNALS = SIGNALS.filter((s) => !s.wrapped && s.key !== "hours" || s.k
 var TRAIT_SET = new Set(TRAIT_SIGNALS);
 
 // src/lib/analyzer/private-vibe.ts
-var PRIVATE_VIBE_VERSION = "observed-habits-1";
+var PRIVATE_VIBE_VERSION = "observed-composite-2";
 var count2 = (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0 && n <= 1e9;
 function validPrivateEvidence(x) {
   if (!x || typeof x !== "object") return false;
@@ -4932,6 +4932,9 @@ function privateVibe(e) {
   if (e.planSessions >= 5 && e.plannedSessions / e.planSessions >= 0.6) options.push({
     title: "The Blueprint Builder",
     summary: "A plan often gets to the workbench before the code does. Your recorded sessions leave room for a blueprint.",
+    affinity: Math.round(100 * e.plannedSessions / e.planSessions),
+    prop: "setsquare",
+    basis: "Share of observed coding sessions with a plan before the first edit.",
     key: "plans",
     name: "A blueprint first",
     evidence: `Planning came before the first edit in ${e.plannedSessions} of ${e.planSessions} observed coding sessions.`
@@ -4939,6 +4942,9 @@ function privateVibe(e) {
   if (e.peakSubagents !== null && e.peakSubagents >= 2) options.push({
     title: "The Parallel Weaver",
     summary: "Your recorded workers overlap. Several subagents have threads on the loom at the same time.",
+    affinity: Math.min(100, e.peakSubagents * 25),
+    prop: "laurel",
+    basis: "Rule scale: peak overlapping subagents divided by four, capped at 100. Not speed or success.",
     key: "parallel",
     name: "Threads together",
     evidence: `Up to ${e.peakSubagents} subagents were recorded working at once. This measures overlap, not speed or success.`
@@ -4946,13 +4952,19 @@ function privateVibe(e) {
   if (e.editTurns >= 10 && e.checkedTurns / e.editTurns >= 0.6) options.push({
     title: "The Check-Loop Tinkerer",
     summary: "A check stays close to the code. Your sessions often put a recorded verification step after an edit, then return to the workbench.",
+    affinity: Math.round(100 * e.checkedTurns / e.editTurns),
+    prop: "magnifier",
+    basis: "Share of edit turns followed by a recorded check; a check may fail.",
     key: "checks",
     name: "Keep a check nearby",
     evidence: `A recorded check followed ${e.checkedTurns} of ${e.editTurns} edit turns. Checks do not establish passing results.`
   });
-  else if (e.readFiles !== null && e.readFiles >= 8 && e.readShare !== null && e.readShare >= 0.75) options.push({
+  if (e.readFiles !== null && e.readFiles >= 8 && e.readShare !== null && e.readShare >= 0.75) options.push({
     title: "The Context Keeper",
     summary: "The recorded work tends to open the page before changing it. Context gets a place at your workbench.",
+    affinity: Math.round(100 * e.readShare),
+    prop: "book",
+    basis: "Share of observed existing-file edits with a prior read; new files excluded.",
     key: "reads",
     name: "Open the page first",
     evidence: `${Math.round(e.readShare * 100)}% of ${e.readFiles} observed existing-file edits had a prior read. New files are excluded.`
@@ -4960,18 +4972,37 @@ function privateVibe(e) {
   if (e.commits >= 3) options.push({
     title: "The Checkpoint Seeker",
     summary: "Your sessions reach for checkpoints. Recorded git commit commands mark attempts to save a stage of the work.",
+    affinity: Math.min(100, Math.round(100 * e.commits / e.sessions)),
+    prop: "key",
+    basis: "Rule scale: recorded commit commands per session, capped at one per session. Commands may fail.",
     key: "commits",
     name: "Reach for a checkpoint",
     evidence: `${e.commits} git commit commands were recorded across ${e.sessions} sessions. Commands may fail.`
   });
   if (!options.length) return null;
+  const supporting = options.slice(0, 3);
+  const titles = {
+    "plans,parallel": "The Blueprint Conductor",
+    "plans,checks": "The Deliberate Architect",
+    "plans,reads": "The Context Architect",
+    "plans,commits": "The Checkpoint Architect",
+    "parallel,checks": "The Watchful Conductor",
+    "parallel,reads": "The Context Conductor",
+    "parallel,commits": "The Checkpoint Conductor",
+    "checks,reads": "The Careful Cartographer",
+    "checks,commits": "The Checkpoint Tinkerer",
+    "reads,commits": "The Context Cartographer"
+  };
+  const patterns = { plans: "planning before edits", parallel: "overlapping workers", checks: "checks after changes", reads: "context before changes", commits: "checkpoint attempts" };
+  const parts = supporting.map((o) => patterns[o.key]);
+  const composite = supporting.length >= 2;
   return {
     version: PRIVATE_VIBE_VERSION,
-    title: options[0].title,
-    summary: options[0].summary,
+    title: composite ? titles[supporting.slice(0, 2).map((o) => o.key).join(",")] : supporting[0].title,
+    summary: composite ? `Your recorded work combines ${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}. Together these patterns form your local work sketch.` : supporting[0].summary,
     sessions: e.sessions,
     prompts: e.prompts,
-    observations: options.slice(0, 3).map(({ key, name, evidence }) => ({ key, name, evidence }))
+    observations: supporting
   };
 }
 
@@ -5460,7 +5491,10 @@ Read ${m.sessions} conversations \xB7 ${m.humanTurns} prompts \xB7 ${m.toolCalls
       console.log(`
 Your local vibe type: ${local.title}
 ${local.summary}`);
-      for (const o of local.observations) console.log(`  ${o.name}: ${o.evidence}`);
+      for (const o of local.observations) console.log(`  ${o.title} \xB7 affinity ${o.affinity}/100 \xB7 ${o.prop} bust
+    ${o.evidence}
+    ${o.basis}`);
+      console.log("Affinities are independent rule scales, not probabilities or shares of a whole.");
       console.log("Rule-based sketch from recorded actions, not a personality or skill assessment. Created on this device; no prompt text sent.");
     } else console.log("\nLocal sketch: more recorded activity is needed to support a pattern. Your measured habits are available below.");
   }

@@ -13,7 +13,7 @@ Signing in works like `gh auth login`: the script shows a link and a short code,
    node "${CLAUDE_PLUGIN_ROOT}/scripts/vibrometer.mjs" login --no-wait $ARGUMENTS
    ```
 
-   It prints a link and a code like `WDJB-MJHT`, and tries to open the link in the user's browser. (If the user gave a token from their account page with `--token`, this saves it instead and you're done; don't repeat the token back.)
+   It prints a link and a code like `WDJB-MJHT`, and tries to open the link in the user's browser. (If the user gave a token with `--token`, this saves it instead and you're done; don't repeat the token back.)
 
 2. **Tell the user what to do**, showing the link and the code exactly as printed: open the link (if it didn't open by itself), sign in with Google, Apple or their email, check that the code on the page matches the code shown here, and click **Approve**. The code expires in 10 minutes.
 
