@@ -4903,6 +4903,78 @@ function buildNarrativeDigest(sessions, values, ref, time = {}) {
 var TRAIT_SIGNALS = SIGNALS.filter((s) => !s.wrapped && s.key !== "hours" || s.key === "weekend" || s.key === "outbursts").map((s) => s.key);
 var TRAIT_SET = new Set(TRAIT_SIGNALS);
 
+// src/lib/analyzer/private-vibe.ts
+var PRIVATE_VIBE_VERSION = "observed-habits-1";
+var count2 = (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0 && n <= 1e9;
+function validPrivateEvidence(x) {
+  if (!x || typeof x !== "object") return false;
+  const e = x;
+  return [e.sessions, e.prompts, e.editTurns, e.checkedTurns, e.planSessions, e.plannedSessions, e.commits].every(count2) && e.checkedTurns <= e.editTurns && e.plannedSessions <= e.planSessions && e.planSessions <= e.sessions && (e.readFiles === null || count2(e.readFiles)) && (e.readShare === null || typeof e.readShare === "number" && Number.isFinite(e.readShare) && e.readShare >= 0 && e.readShare <= 1) && e.readFiles === null === (e.readShare === null) && (e.peakSubagents === null || count2(e.peakSubagents));
+}
+function privateVibeEvidence(m) {
+  const e = {
+    sessions: m.sessions,
+    prompts: m.humanTurns,
+    editTurns: m.editTurns,
+    checkedTurns: m.verifiedEditTurns,
+    planSessions: m.sessionsWithEdits - (m.unmeasuredPlanSessions ?? 0),
+    plannedSessions: m.sessionsPlanFirst,
+    readFiles: m.readBeforeEditFiles ?? null,
+    readShare: m.readBeforeEditFiles === void 0 ? null : m.readBeforeEditRatio,
+    peakSubagents: m.peakSubagents ?? null,
+    commits: m.gitCommits
+  };
+  return validPrivateEvidence(e) ? e : null;
+}
+function privateVibe(e) {
+  if (!validPrivateEvidence(e) || e.sessions < 3 || e.prompts < 20) return null;
+  const options = [];
+  if (e.planSessions >= 5 && e.plannedSessions / e.planSessions >= 0.6) options.push({
+    title: "The Blueprint Builder",
+    summary: "A plan often gets to the workbench before the code does. Your recorded sessions leave room for a blueprint.",
+    key: "plans",
+    name: "A blueprint first",
+    evidence: `Planning came before the first edit in ${e.plannedSessions} of ${e.planSessions} observed coding sessions.`
+  });
+  if (e.peakSubagents !== null && e.peakSubagents >= 2) options.push({
+    title: "The Parallel Weaver",
+    summary: "Your recorded workers overlap. Several subagents have threads on the loom at the same time.",
+    key: "parallel",
+    name: "Threads together",
+    evidence: `Up to ${e.peakSubagents} subagents were recorded working at once. This measures overlap, not speed or success.`
+  });
+  if (e.editTurns >= 10 && e.checkedTurns / e.editTurns >= 0.6) options.push({
+    title: "The Check-Loop Tinkerer",
+    summary: "A check stays close to the code. Your sessions often put a recorded verification step after an edit, then return to the workbench.",
+    key: "checks",
+    name: "Keep a check nearby",
+    evidence: `A recorded check followed ${e.checkedTurns} of ${e.editTurns} edit turns. Checks do not establish passing results.`
+  });
+  else if (e.readFiles !== null && e.readFiles >= 8 && e.readShare !== null && e.readShare >= 0.75) options.push({
+    title: "The Context Keeper",
+    summary: "The recorded work tends to open the page before changing it. Context gets a place at your workbench.",
+    key: "reads",
+    name: "Open the page first",
+    evidence: `${Math.round(e.readShare * 100)}% of ${e.readFiles} observed existing-file edits had a prior read. New files are excluded.`
+  });
+  if (e.commits >= 3) options.push({
+    title: "The Checkpoint Seeker",
+    summary: "Your sessions reach for checkpoints. Recorded git commit commands mark attempts to save a stage of the work.",
+    key: "commits",
+    name: "Reach for a checkpoint",
+    evidence: `${e.commits} git commit commands were recorded across ${e.sessions} sessions. Commands may fail.`
+  });
+  if (!options.length) return null;
+  return {
+    version: PRIVATE_VIBE_VERSION,
+    title: options[0].title,
+    summary: options[0].summary,
+    sessions: e.sessions,
+    prompts: e.prompts,
+    observations: options.slice(0, 3).map(({ key, name, evidence }) => ({ key, name, evidence }))
+  };
+}
+
 // src/lib/analyzer/combine.ts
 var ledgerKey = (s) => `${s.source === "codex" ? "codex" : "claude"}:${s.id}`;
 function ledgerEntries(sessions, opts = {}) {
@@ -5382,6 +5454,16 @@ Read ${m.sessions} conversations \xB7 ${m.humanTurns} prompts \xB7 ${m.toolCalls
   const ledgerOf = () => ledgerCache ??= ledgerEntries(chosen.map((c) => c.s), time);
   let numbersOnly = priv || over;
   const digest = narrativeDigestOf(chosen.map((c) => c.s), signalValues(m), time);
+  if (priv && !vibeTypeOptIn) {
+    const local = privateVibe(privateVibeEvidence(m));
+    if (local) {
+      console.log(`
+Your local vibe type: ${local.title}
+${local.summary}`);
+      for (const o of local.observations) console.log(`  ${o.name}: ${o.evidence}`);
+      console.log("Rule-based sketch from recorded actions, not a personality or skill assessment. Created on this device; no prompt text sent.");
+    } else console.log("\nLocal sketch: more recorded activity is needed to support a pattern. Your measured habits are available below.");
+  }
   const sendsDigest = () => priv ? vibeTypeOptIn : numbersOnly;
   const timelineOf = () => buildTimeline(chosen.map((c) => c.s), time);
   if (!priv && !over && !transcripts.length) {
@@ -5400,7 +5482,7 @@ That's more than ${UPLOAD_LIMIT_LABEL} of conversations after compaction, more t
 \u2026and your habits as numbers per day, week, month, quarter and year (${timeline2.periods.month?.length ?? 0} months, ${timeline2.periods.day?.length ?? 0} days), for "Over time" on your vibe check.`);
       if (sendsDigest()) printDigest(digest);
       else console.log(`
-No vibe type: in private mode nothing you wrote is sent. To get one, add --vibe-type: it also sends a scrubbed sample of up to ${MAX_PROMPTS} of your prompts to write it, and this preview shows exactly which.`);
+No AI-written vibe type: in private mode nothing you wrote is sent. A separate opt-in with --vibe-type sends a scrubbed sample of up to ${MAX_PROMPTS} of your prompts; this preview shows exactly which.`);
     } else {
       console.log(`
 Would upload ${mains.length} redacted conversation(s), ${(bytes / 1e6).toFixed(1)}MB:`);
