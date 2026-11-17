@@ -7,7 +7,7 @@
     {
       "name": "vibrometer",
       "source": "./plugin",
-      "description": "Your vibe check from the conversations you choose, plus timed AI-coding challenges."
+      "description": "See how you work with Claude Code and Codex: your habits as percentiles against other developers, from the sessions you choose, plus timed AI-coding challenges."
     }
   ]
 }
