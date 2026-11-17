@@ -1,13 +1,21 @@
 {
   "name": "vibrometer",
   "version": "0.3.1",
-  "description": "See how you code with AI: get your vibe check from your Claude Code and Codex conversations (you choose which to include), compare with friends, and compete on timed challenges.",
+  "description": "See how you work with coding agents: your habits from the Claude Code and Codex sessions you choose, each as a percentile against other developers, plus timed AI-coding challenges. vibrometer.ai",
   "author": {
-    "name": "Vibrometer"
+    "name": "Vibrometer",
+    "url": "https://vibrometer.ai"
   },
+  "homepage": "https://vibrometer.ai",
+  "repository": "https://github.com/usesieve/vibrometer-plugin",
   "keywords": [
+    "claude-code",
+    "codex",
     "vibe coding",
     "agentic coding",
+    "coding habits",
+    "usage stats",
+    "analytics",
     "vibe-check",
     "challenges",
     "leaderboard"
